@@ -24,8 +24,13 @@ pub enum Change {
 pub trait Adapter {
     /// Alterações locais desde a última chamada.
     fn take_changes(&mut self) -> Vec<Change>;
-    /// O documento compartilhado inteiro.
+    /// O documento compartilhado inteiro (quem entra, ressincronização).
     fn snapshot(&mut self) -> Result<Vec<u8>>;
+    /// O documento enviado depois de desfazer/refazer ou gestos. Por padrão é o mesmo de
+    /// [`Adapter::snapshot`]; apps com arquivos grandes (fotos) mandam só o que muda.
+    fn replace_snapshot(&mut self) -> Result<Vec<u8>> {
+        self.snapshot()
+    }
     /// Carrega um documento recebido, preservando a visão pessoal.
     fn load(&mut self, doc: &[u8]) -> Result<()>;
     /// Roda o comando de um colega no contexto dele, sem entrar no desfazer local.
@@ -106,7 +111,7 @@ impl Live {
         if !force && (app.busy() || throttled) {
             return;
         }
-        match app.snapshot() {
+        match app.replace_snapshot() {
             Ok(doc) => {
                 self.send_replace(&doc);
                 self.replace_due = false;
