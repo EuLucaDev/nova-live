@@ -59,6 +59,10 @@ impl Client {
 }
 
 fn relay() -> String {
+    // NOVA_LIVE_SERVER=wss://live.agcunae.com/ roda os mesmos testes contra o servidor real.
+    if let Ok(s) = std::env::var("NOVA_LIVE_SERVER") {
+        return s;
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let addr = listener.local_addr().unwrap();
