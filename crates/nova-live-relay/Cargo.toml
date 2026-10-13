@@ -1,0 +1,18 @@
+[package]
+name = "nova-live-relay"
+description = "Servidor das sessões Nova Live (live.agcunae.com)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+nova-live = { path = "../nova-live" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
+tokio-tungstenite = "0.27"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
