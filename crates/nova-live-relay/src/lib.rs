@@ -42,7 +42,10 @@ struct Room {
 
 impl Room {
     fn peers(&self) -> Vec<Peer> {
-        self.order.iter().filter_map(|id| self.members.get(id).map(|m| m.peer.clone())).collect()
+        self.order
+            .iter()
+            .filter_map(|id| self.members.get(id).map(|m| m.peer.clone()))
+            .collect()
     }
     fn broadcast(&self, msg: &ServerMsg) {
         for m in self.members.values() {
@@ -65,7 +68,11 @@ struct State {
 type Shared = Arc<Mutex<State>>;
 
 fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 fn clean_name(name: &str) -> String {
@@ -78,7 +85,9 @@ fn clean_name(name: &str) -> String {
 pub async fn run(listener: TcpListener) {
     let state: Shared = Arc::default();
     loop {
-        let Ok((stream, addr)) = listener.accept().await else { continue };
+        let Ok((stream, addr)) = listener.accept().await else {
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
             serve(stream, addr, state).await;
@@ -92,7 +101,12 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
     let n = stream.peek(&mut buf).await.unwrap_or(0);
     let head = String::from_utf8_lossy(&buf[..n]);
     let line = head.lines().next().unwrap_or_default().to_string();
-    if line.starts_with("GET ") && line.split(' ').nth(1).is_some_and(|p| p.ends_with("/healthz")) {
+    if line.starts_with("GET ")
+        && line
+            .split(' ')
+            .nth(1)
+            .is_some_and(|p| p.ends_with("/healthz"))
+    {
         let mut stream = stream;
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 3\r\nconnection: close\r\n\r\nok\n").await;
         return;
@@ -100,12 +114,16 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
     let mut cfg = WebSocketConfig::default();
     cfg.max_message_size = Some(MAX_MESSAGE);
     cfg.max_frame_size = Some(MAX_MESSAGE);
-    let Ok(ws) = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await else { return };
+    let Ok(ws) = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await else {
+        return;
+    };
     let (mut sink, mut source) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let Ok(text) = serde_json::to_string(&msg) else { continue };
+            let Ok(text) = serde_json::to_string(&msg) else {
+                continue;
+            };
             let end = matches!(msg, ServerMsg::Ended { .. } | ServerMsg::Refused { .. });
             if sink.send(Message::text(text)).await.is_err() {
                 break;
@@ -123,7 +141,9 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(t.as_str()) {
                 Ok(m @ ClientMsg::Hello { .. }) => break m,
                 _ => {
-                    let _ = tx.send(ServerMsg::Refused { reason: "mensagem inicial inválida".into() });
+                    let _ = tx.send(ServerMsg::Refused {
+                        reason: "mensagem inicial inválida".into(),
+                    });
                     return;
                 }
             },
@@ -131,12 +151,34 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
             _ => return,
         }
     };
-    let ClientMsg::Hello { protocol, app, room, token, host_token, name } = hello else { return };
+    let ClientMsg::Hello {
+        protocol,
+        app,
+        room,
+        token,
+        host_token,
+        name,
+    } = hello
+    else {
+        return;
+    };
     if protocol != PROTOCOL {
-        let _ = tx.send(ServerMsg::Refused { reason: "versão do app diferente da do servidor: atualize o app pelo launcher".into() });
+        let _ = tx.send(ServerMsg::Refused {
+            reason: "versão do app diferente da do servidor: atualize o app pelo launcher".into(),
+        });
         return;
     }
-    let me = match join(&state, &app, &room, &token, host_token.as_deref(), &clean_name(&name), tx.clone()).await {
+    let me = match join(
+        &state,
+        &app,
+        &room,
+        &token,
+        host_token.as_deref(),
+        &clean_name(&name),
+        tx.clone(),
+    )
+    .await
+    {
         Ok(id) => id,
         Err(reason) => {
             let _ = tx.send(ServerMsg::Refused { reason });
@@ -151,25 +193,52 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(_) => continue,
         };
-        let Ok(msg) = serde_json::from_str::<ClientMsg>(text.as_str()) else { continue };
+        let Ok(msg) = serde_json::from_str::<ClientMsg>(text.as_str()) else {
+            continue;
+        };
         let mut st = state.lock().await;
-        let Some(r) = st.rooms.get_mut(&room) else { break };
+        let Some(r) = st.rooms.get_mut(&room) else {
+            break;
+        };
         let is_host = r.host.as_deref() == Some(me.as_str());
         match msg {
-            ClientMsg::Op { local, cmd, params, ctx } => {
+            ClientMsg::Op {
+                local,
+                cmd,
+                params,
+                ctx,
+            } => {
                 r.rev += 1;
-                let m = ServerMsg::Op { rev: r.rev, author: me.clone(), local, cmd, params, ctx };
+                let m = ServerMsg::Op {
+                    rev: r.rev,
+                    author: me.clone(),
+                    local,
+                    cmd,
+                    params,
+                    ctx,
+                };
                 r.broadcast(&m);
             }
             ClientMsg::Replace { local, doc } => {
                 r.rev += 1;
-                let m = ServerMsg::Replace { rev: r.rev, author: me.clone(), local, doc };
+                let m = ServerMsg::Replace {
+                    rev: r.rev,
+                    author: me.clone(),
+                    local,
+                    doc,
+                };
                 r.broadcast(&m);
             }
             ClientMsg::Snapshot { rev, doc } if is_host => {
                 let rev = rev.min(r.rev);
                 for id in std::mem::take(&mut r.awaiting) {
-                    r.send_to(&id, ServerMsg::Snapshot { rev, doc: doc.clone() });
+                    r.send_to(
+                        &id,
+                        ServerMsg::Snapshot {
+                            rev,
+                            doc: doc.clone(),
+                        },
+                    );
                 }
             }
             ClientMsg::Digest { rev, digest } if is_host => {
@@ -194,7 +263,15 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
     let _ = writer.await;
 }
 
-async fn join(state: &Shared, app: &str, room: &str, token: &str, host_token: Option<&str>, name: &str, tx: Tx) -> Result<String, String> {
+async fn join(
+    state: &Shared,
+    app: &str,
+    room: &str,
+    token: &str,
+    host_token: Option<&str>,
+    name: &str,
+    tx: Tx,
+) -> Result<String, String> {
     if room.len() < 16 || room.len() > 64 || token.len() < 16 || token.len() > 128 {
         return Err("convite inválido".into());
     }
@@ -220,9 +297,23 @@ async fn join(state: &Shared, app: &str, room: &str, token: &str, host_token: Op
                 return Err("esta sessão já tem anfitrião".into());
             }
             r.host = Some(id.clone());
-            r.members.insert(id.clone(), Member { peer: Peer { id: id.clone(), name: name.to_string(), host: true }, tx });
+            r.members.insert(
+                id.clone(),
+                Member {
+                    peer: Peer {
+                        id: id.clone(),
+                        name: name.to_string(),
+                        host: true,
+                    },
+                    tx,
+                },
+            );
             r.order.push(id.clone());
-            let _ = r.members[&id].tx.send(ServerMsg::Welcome { you: id.clone(), rev: r.rev, peers: r.peers() });
+            let _ = r.members[&id].tx.send(ServerMsg::Welcome {
+                you: id.clone(),
+                rev: r.rev,
+                peers: r.peers(),
+            });
         }
         None => {
             let Some(r) = st.rooms.get_mut(room) else {
@@ -234,10 +325,27 @@ async fn join(state: &Shared, app: &str, room: &str, token: &str, host_token: Op
             if !same(&r.token, token) {
                 return Err("convite inválido".into());
             }
-            r.members.insert(id.clone(), Member { peer: Peer { id: id.clone(), name: name.to_string(), host: false }, tx });
+            r.members.insert(
+                id.clone(),
+                Member {
+                    peer: Peer {
+                        id: id.clone(),
+                        name: name.to_string(),
+                        host: false,
+                    },
+                    tx,
+                },
+            );
             r.order.push(id.clone());
             r.awaiting.insert(id.clone());
-            r.send_to(&id, ServerMsg::Welcome { you: id.clone(), rev: r.rev, peers: r.peers() });
+            r.send_to(
+                &id,
+                ServerMsg::Welcome {
+                    you: id.clone(),
+                    rev: r.rev,
+                    peers: r.peers(),
+                },
+            );
             if let Some(h) = r.host.clone() {
                 r.send_to(&h, ServerMsg::WantSnapshot);
             }
@@ -251,12 +359,16 @@ async fn join(state: &Shared, app: &str, room: &str, token: &str, host_token: Op
 
 async fn leave(state: &Shared, room: &str, me: &str) {
     let mut st = state.lock().await;
-    let Some(r) = st.rooms.get_mut(room) else { return };
+    let Some(r) = st.rooms.get_mut(room) else {
+        return;
+    };
     r.members.remove(me);
     r.order.retain(|x| x != me);
     r.awaiting.remove(me);
     if r.host.as_deref() == Some(me) {
-        r.broadcast(&ServerMsg::Ended { reason: "O anfitrião encerrou a sessão.".into() });
+        r.broadcast(&ServerMsg::Ended {
+            reason: "O anfitrião encerrou a sessão.".into(),
+        });
         st.rooms.remove(room);
     } else {
         r.broadcast(&ServerMsg::Peers { peers: r.peers() });

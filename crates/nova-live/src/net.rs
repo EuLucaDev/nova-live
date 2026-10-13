@@ -34,15 +34,21 @@ fn parse(server: &str) -> Result<Target> {
     };
     let authority = rest.split('/').next().unwrap_or_default();
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => {
-            (h.trim_matches(|c| c == '[' || c == ']').to_string(), p.parse().map_err(|_| err("porta inválida no servidor"))?)
-        }
+        Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => (
+            h.trim_matches(|c| c == '[' || c == ']').to_string(),
+            p.parse().map_err(|_| err("porta inválida no servidor"))?,
+        ),
         _ => (authority.to_string(), if secure { 443 } else { 80 }),
     };
     if host.is_empty() {
         return Err(err("servidor sem endereço"));
     }
-    Ok(Target { secure, host, port, url: server.to_string() })
+    Ok(Target {
+        secure,
+        host,
+        port,
+        url: server.to_string(),
+    })
 }
 
 /// Fluxo TLS ou simples, com leitura e escrita pelo mesmo dono.
@@ -80,9 +86,11 @@ fn connect(t: &Target) -> Result<WebSocket<Stream>> {
         .map_err(|e| err(format!("não encontrei o servidor {}: {e}", t.host)))?
         .next()
         .ok_or_else(|| err(format!("não encontrei o servidor {}", t.host)))?;
-    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| err(format!("sem conexão com {}: {e}", t.host)))?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|e| err(format!("sem conexão com {}: {e}", t.host)))?;
     let _ = tcp.set_nodelay(true);
-    tcp.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| err(e.to_string()))?;
+    tcp.set_read_timeout(Some(CONNECT_TIMEOUT))
+        .map_err(|e| err(e.to_string()))?;
     let stream = if t.secure {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -92,8 +100,10 @@ fn connect(t: &Target) -> Result<WebSocket<Stream>> {
             .map_err(|e| err(e.to_string()))?
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let name = rustls::pki_types::ServerName::try_from(t.host.clone()).map_err(|_| err("nome de servidor inválido"))?;
-        let conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| err(e.to_string()))?;
+        let name = rustls::pki_types::ServerName::try_from(t.host.clone())
+            .map_err(|_| err("nome de servidor inválido"))?;
+        let conn = rustls::ClientConnection::new(Arc::new(config), name)
+            .map_err(|e| err(e.to_string()))?;
         Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
     } else {
         Stream::Plain(tcp)
@@ -107,7 +117,8 @@ fn connect(t: &Target) -> Result<WebSocket<Stream>> {
         Stream::Plain(s) => s,
         Stream::Tls(s) => s.get_ref(),
     };
-    tcp.set_read_timeout(Some(READ_SLICE)).map_err(|e| err(e.to_string()))?;
+    tcp.set_read_timeout(Some(READ_SLICE))
+        .map_err(|e| err(e.to_string()))?;
     Ok(ws)
 }
 
@@ -116,7 +127,10 @@ fn idle(e: &tungstenite::Error) -> bool {
 }
 
 /// Conecta na thread de rede e devolve (envio, recebimento). Falha de conexão é devolvida aqui.
-pub(crate) fn spawn(server: &str, hello: ClientMsg) -> Result<(Sender<ClientMsg>, Receiver<ServerMsg>)> {
+pub(crate) fn spawn(
+    server: &str,
+    hello: ClientMsg,
+) -> Result<(Sender<ClientMsg>, Receiver<ServerMsg>)> {
     let target = parse(server)?;
     let (out_tx, out_rx) = mpsc::channel::<ClientMsg>();
     let (in_tx, in_rx) = mpsc::channel::<ServerMsg>();
@@ -132,7 +146,8 @@ pub(crate) fn spawn(server: &str, hello: ClientMsg) -> Result<(Sender<ClientMsg>
                 }
             };
             let first = serde_json::to_string(&hello).map_err(|e| err(e.to_string()));
-            let sent = first.and_then(|t| ws.send(Message::text(t)).map_err(|e| err(e.to_string())));
+            let sent =
+                first.and_then(|t| ws.send(Message::text(t)).map_err(|e| err(e.to_string())));
             if let Err(e) = sent {
                 let _ = ready_tx.send(Err(e));
                 return;
@@ -160,7 +175,9 @@ fn run(mut ws: WebSocket<Stream>, out: Receiver<ClientMsg>, inbox: Sender<Server
                     return;
                 }
                 Ok(msg) => {
-                    let Ok(text) = serde_json::to_string(&msg) else { continue };
+                    let Ok(text) = serde_json::to_string(&msg) else {
+                        continue;
+                    };
                     if ws.write(Message::text(text)).is_err() {
                         return;
                     }

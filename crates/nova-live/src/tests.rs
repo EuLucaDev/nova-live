@@ -14,7 +14,9 @@ fn invite_links_round_trip() {
     let i = sample();
     assert_eq!(Invite::parse(&i.to_link()).unwrap(), i);
     let share = i.to_share_link();
-    assert!(share.starts_with("https://workflowind.agcunae.com/apps/join#invite=novalive%3A%2F%2Fjoin"));
+    assert!(
+        share.starts_with("https://workflowind.agcunae.com/apps/join#invite=novalive%3A%2F%2Fjoin")
+    );
     assert_eq!(Invite::parse(&share).unwrap(), i);
     assert_eq!(Invite::parse(&format!("  {share}\n")).unwrap(), i);
 }

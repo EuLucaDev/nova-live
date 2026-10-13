@@ -23,8 +23,11 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod adapter;
 mod net;
 pub mod proto;
+
+pub use adapter::{Adapter, Change, Notice};
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -109,7 +112,9 @@ fn dec(s: &str) -> Option<String> {
 }
 
 fn valid_id(s: &str, min: usize, max: usize) -> bool {
-    (min..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    (min..=max).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 impl Invite {
@@ -140,10 +145,14 @@ impl Invite {
         } else {
             s.to_string()
         };
-        let query = link.strip_prefix("novalive://join?").ok_or_else(|| err("isto não é um convite Nova Live"))?;
+        let query = link
+            .strip_prefix("novalive://join?")
+            .ok_or_else(|| err("isto não é um convite Nova Live"))?;
         let (mut app, mut server, mut room, mut token) = (None, None, None, None);
         for pair in query.split('&') {
-            let (k, v) = pair.split_once('=').ok_or_else(|| err("convite inválido"))?;
+            let (k, v) = pair
+                .split_once('=')
+                .ok_or_else(|| err("convite inválido"))?;
             let v = dec(v).ok_or_else(|| err("convite inválido"))?;
             let slot = match k {
                 "app" => &mut app,
@@ -165,7 +174,12 @@ impl Invite {
         if !(server.starts_with("wss://") || server.starts_with("ws://")) || server.len() > 300 {
             return Err(err("servidor do convite inválido"));
         }
-        Ok(Invite { app, server, room, token })
+        Ok(Invite {
+            app,
+            server,
+            room,
+            token,
+        })
     }
 }
 
@@ -192,7 +206,12 @@ pub enum Event {
     /// Carregar este documento inteiro (entrada na sessão, ressincronização ou desfazer de alguém).
     Load(Vec<u8>),
     /// Aplicar o comando de outra pessoa, com o contexto (seleção) que ela tinha.
-    Apply { author: String, cmd: String, params: Json, ctx: Json },
+    Apply {
+        author: String,
+        cmd: String,
+        params: Json,
+        ctx: Json,
+    },
     /// Alguém pediu o documento: responder com [`Live::send_snapshot`] (só o anfitrião recebe).
     SnapshotWanted,
     /// Quem está na sessão mudou.
@@ -231,12 +250,21 @@ pub struct Live {
     /// Convidado: já carregou o documento; antes disso as alterações ficam guardadas.
     loaded: bool,
     early: Vec<ServerMsg>,
+    /// Ciclo por quadro ([`Live::pump`]): documento inteiro pendente e participantes conhecidos.
+    replace_due: bool,
+    last_replace: Option<Instant>,
+    known: Vec<Peer>,
 }
 
 impl Live {
     /// Abre uma sessão para o documento atual e devolve o convite para enviar.
     pub fn host(app: &str, server: &str, name: &str) -> Result<Live> {
-        let invite = Invite { app: app.to_string(), server: server.to_string(), room: random_id(16)?, token: random_id(18)? };
+        let invite = Invite {
+            app: app.to_string(),
+            server: server.to_string(),
+            room: random_id(16)?,
+            token: random_id(18)?,
+        };
         let host_token = random_id(18)?;
         let hello = ClientMsg::Hello {
             protocol: proto::PROTOCOL,
@@ -252,7 +280,10 @@ impl Live {
     /// Entra num documento pelo convite (de qualquer forma aceita por [`Invite::parse`]).
     pub fn join(invite: &Invite, app: &str, name: &str) -> Result<Live> {
         if invite.app != app {
-            return Err(err(format!("este convite é do app {}, não deste", invite.app)));
+            return Err(err(format!(
+                "este convite é do app {}, não deste",
+                invite.app
+            )));
         }
         let hello = ClientMsg::Hello {
             protocol: proto::PROTOCOL,
@@ -284,6 +315,9 @@ impl Live {
             snapshot_wanted: false,
             loaded: role == Role::Host,
             early: vec![],
+            replace_due: false,
+            last_replace: None,
+            known: vec![],
         })
     }
 
@@ -312,7 +346,12 @@ impl Live {
         self.next_local += 1;
         self.pending.push(local);
         self.last_change = Some(Instant::now());
-        self.send(ClientMsg::Op { local, cmd: cmd.to_string(), params: params.clone(), ctx: ctx.clone() });
+        self.send(ClientMsg::Op {
+            local,
+            cmd: cmd.to_string(),
+            params: params.clone(),
+            ctx: ctx.clone(),
+        });
     }
 
     /// Uma alteração local que não é comando (desfazer, refazer…): o documento inteiro.
@@ -321,12 +360,18 @@ impl Live {
         self.next_local += 1;
         self.pending.push(local);
         self.last_change = Some(Instant::now());
-        self.send(ClientMsg::Replace { local, doc: base64::engine::general_purpose::STANDARD.encode(doc) });
+        self.send(ClientMsg::Replace {
+            local,
+            doc: base64::engine::general_purpose::STANDARD.encode(doc),
+        });
     }
 
     /// Anfitrião: o documento para quem pediu (entrada ou ressincronização).
     pub fn send_snapshot(&mut self, doc: &[u8]) {
-        self.send(ClientMsg::Snapshot { rev: self.rev, doc: base64::engine::general_purpose::STANDARD.encode(doc) });
+        self.send(ClientMsg::Snapshot {
+            rev: self.rev,
+            doc: base64::engine::general_purpose::STANDARD.encode(doc),
+        });
     }
 
     /// Anfitrião: chame a cada quadro; quando a sessão fica parada, publica a impressão digital
@@ -340,7 +385,10 @@ impl Live {
         }
         let d = digest_of();
         self.digest_sent_for = self.rev;
-        self.send(ClientMsg::Digest { rev: self.rev, digest: d });
+        self.send(ClientMsg::Digest {
+            rev: self.rev,
+            digest: d,
+        });
     }
 
     /// Convidado: confere a impressão digital do anfitrião quando estiver em dia; diferente, pede
@@ -407,7 +455,9 @@ impl Live {
                     // Alterações que chegaram antes do documento: só as posteriores a ele.
                     for early in std::mem::take(&mut self.early) {
                         let newer = match &early {
-                            ServerMsg::Op { rev: r, .. } | ServerMsg::Replace { rev: r, .. } => *r > rev,
+                            ServerMsg::Op { rev: r, .. } | ServerMsg::Replace { rev: r, .. } => {
+                                *r > rev
+                            }
                             _ => true,
                         };
                         if newer {
@@ -419,16 +469,33 @@ impl Live {
             msg @ (ServerMsg::Op { .. } | ServerMsg::Replace { .. }) if !self.loaded => {
                 self.early.push(msg);
             }
-            ServerMsg::Op { rev, author, local, cmd, params, ctx } => {
+            ServerMsg::Op {
+                rev,
+                author,
+                local,
+                cmd,
+                params,
+                ctx,
+            } => {
                 self.rev = rev;
                 if author == self.me {
                     self.pending.retain(|l| *l != local);
                 } else {
                     self.last_change = Some(Instant::now());
-                    events.push(Event::Apply { author, cmd, params, ctx });
+                    events.push(Event::Apply {
+                        author,
+                        cmd,
+                        params,
+                        ctx,
+                    });
                 }
             }
-            ServerMsg::Replace { rev, author, local, doc } => {
+            ServerMsg::Replace {
+                rev,
+                author,
+                local,
+                doc,
+            } => {
                 self.rev = rev;
                 if author == self.me {
                     self.pending.retain(|l| *l != local);
