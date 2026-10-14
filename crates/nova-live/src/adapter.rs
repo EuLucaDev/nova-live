@@ -1,6 +1,8 @@
 //! O ciclo de cada quadro, comum a todos os apps: o app implementa [`Adapter`] sobre o próprio
 //! motor e chama [`Live::pump`] uma vez por quadro.
 
+use std::io::Read;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::Value as Json;
@@ -41,6 +43,23 @@ pub trait Adapter {
     fn busy(&self) -> bool {
         false
     }
+    /// Mídias (vídeos, áudios, imagens externas) que o documento compartilhado usa, pela chave
+    /// que o documento guarda (em geral o caminho). Só estas podem ser enviadas a colegas.
+    fn media(&mut self) -> Vec<String> {
+        vec![]
+    }
+    /// Esta mídia já está disponível aqui (arquivo no caminho ou recebida antes)?
+    fn media_available(&mut self, _key: &str) -> bool {
+        true
+    }
+    /// Abre a mídia para enviar: leitor e tamanho em bytes. `None` se não estiver aqui.
+    fn media_open(&mut self, _key: &str) -> Option<(Box<dyn Read + Send>, u64)> {
+        None
+    }
+    /// A mídia chegou e está em `path`: o app passa a usar esse arquivo para a chave.
+    fn media_ready(&mut self, _key: &str, _path: &Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// O que mostrar à pessoa.
@@ -52,6 +71,8 @@ pub enum Notice {
     Problem(String),
     /// Quem coordenava saiu; esta pessoa passou a coordenar (a sessão continua).
     Promoted,
+    /// Uma mídia do documento chegou e já está em uso (nome do arquivo).
+    MediaReady(String),
 }
 
 /// Entre dois envios de documento inteiro, no máximo este intervalo (gestos longos).
@@ -92,9 +113,33 @@ impl Live {
                 Event::Peers(peers) => notices.extend(diff_peers(&self.known, &peers)),
                 Event::Ended(reason) => notices.push(Notice::Ended(reason)),
                 Event::Promoted => notices.push(Notice::Promoted),
+                Event::MediaWanted { from, key } => self.media_wanted(app, from, key),
+                Event::MediaChunk {
+                    from,
+                    key,
+                    offset,
+                    total,
+                    data,
+                    digest,
+                } => {
+                    if let Some((key, path)) =
+                        self.media_chunk(from, key, offset, total, &data, digest)
+                    {
+                        match app.media_ready(&key, &path) {
+                            Ok(()) => {
+                                notices.push(Notice::MediaReady(crate::media::display_name(&key)))
+                            }
+                            Err(e) => notices.push(Notice::Problem(e.to_string())),
+                        }
+                    }
+                }
             }
         }
         self.known = self.peers().to_vec();
+        if !self.is_ended() {
+            self.media_scan(app);
+            self.media_send();
+        }
         if !app.busy() {
             match self.role() {
                 Role::Host => self.tick_digest(|| app.digest().unwrap_or(0)),

@@ -4,6 +4,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -136,9 +137,11 @@ fn idle(e: &tungstenite::Error) -> bool {
 }
 
 /// Conecta na thread de rede e devolve (envio, recebimento). Falha de conexão é devolvida aqui.
+/// `backlog`: bytes de mídia na fila de envio (o app espera esvaziar antes de ler mais).
 pub(crate) fn spawn(
     server: &str,
     hello: ClientMsg,
+    backlog: Arc<AtomicUsize>,
 ) -> Result<(Sender<ClientMsg>, Receiver<ServerMsg>)> {
     let target = parse(server)?;
     let (out_tx, out_rx) = mpsc::channel::<ClientMsg>();
@@ -162,7 +165,7 @@ pub(crate) fn spawn(
                 return;
             }
             let _ = ready_tx.send(Ok(()));
-            run(ws, out_rx, in_tx);
+            run(ws, out_rx, in_tx, &backlog);
         })
         .map_err(|e| err(e.to_string()))?;
     match ready_rx.recv_timeout(CONNECT_TIMEOUT * 2) {
@@ -172,7 +175,12 @@ pub(crate) fn spawn(
     }
 }
 
-fn run(mut ws: WebSocket<Stream>, out: Receiver<ClientMsg>, inbox: Sender<ServerMsg>) {
+fn run(
+    mut ws: WebSocket<Stream>,
+    out: Receiver<ClientMsg>,
+    inbox: Sender<ServerMsg>,
+    backlog: &AtomicUsize,
+) {
     let mut last_ping = Instant::now();
     loop {
         // Escreve tudo o que o app mandou.
@@ -184,10 +192,23 @@ fn run(mut ws: WebSocket<Stream>, out: Receiver<ClientMsg>, inbox: Sender<Server
                     return;
                 }
                 Ok(msg) => {
+                    let media = match &msg {
+                        ClientMsg::MediaChunk { data, .. } => data.len(),
+                        _ => 0,
+                    };
                     let Ok(text) = serde_json::to_string(&msg) else {
                         continue;
                     };
-                    if ws.write(Message::text(text)).is_err() {
+                    let written = ws.write(Message::text(text));
+                    if media > 0 {
+                        // Escrito no buffer: espera o envio para liberar a fila do app.
+                        let _ = ws.flush();
+                        backlog.fetch_sub(
+                            media.min(backlog.load(Ordering::Relaxed)),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    if written.is_err() {
                         return;
                     }
                 }

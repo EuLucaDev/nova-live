@@ -315,3 +315,105 @@ fn a_new_invite_stops_the_old_link_but_keeps_who_is_already_in() {
         },
     );
 }
+
+/// Um app com mídias: o documento usa `keys`; `files` diz onde cada uma está nesta máquina.
+struct MediaApp {
+    doc: Doc,
+    keys: Vec<String>,
+    files: std::collections::HashMap<String, std::path::PathBuf>,
+}
+
+impl Adapter for MediaApp {
+    fn take_changes(&mut self) -> Vec<Change> {
+        vec![]
+    }
+    fn snapshot(&mut self) -> nova_live::Result<Vec<u8>> {
+        Ok(self.doc.bytes())
+    }
+    fn load(&mut self, doc: &[u8]) -> nova_live::Result<()> {
+        self.doc.load(doc);
+        Ok(())
+    }
+    fn apply(&mut self, _: &str, _: &Value, _: &Value) -> nova_live::Result<()> {
+        Ok(())
+    }
+    fn digest(&mut self) -> nova_live::Result<u64> {
+        Ok(nova_live::digest(&self.doc.bytes()))
+    }
+    fn media(&mut self) -> Vec<String> {
+        self.keys.clone()
+    }
+    fn media_available(&mut self, key: &str) -> bool {
+        self.files.contains_key(key)
+    }
+    fn media_open(&mut self, key: &str) -> Option<(Box<dyn std::io::Read + Send>, u64)> {
+        nova_live::media::open_file(self.files.get(key)?)
+    }
+    fn media_ready(&mut self, key: &str, path: &std::path::Path) -> nova_live::Result<()> {
+        self.files.insert(key.to_string(), path.to_path_buf());
+        Ok(())
+    }
+}
+
+#[test]
+fn media_the_document_uses_reaches_the_guest_and_nothing_else_leaves() {
+    let dir = std::env::temp_dir().join(format!("nova-live-media-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ana")).unwrap();
+    // SAFETY dos testes: a pasta de mídias recebidas é a deste teste.
+    unsafe { std::env::set_var("NOVA_LIVE_MEDIA_DIR", dir.join("recebidas")) };
+    let video = dir.join("ana/entrevista.mov");
+    let content: Vec<u8> = (0..3_500_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&video, &content).unwrap();
+    let secret = dir.join("ana/segredo.txt");
+    std::fs::write(&secret, b"nao pode sair").unwrap();
+    let key = video.to_string_lossy().into_owned();
+
+    let server = relay();
+    let mut ana_live = Live::host("novafilm", &server, "Ana").unwrap();
+    let mut ana = MediaApp {
+        doc: Doc(vec![key.clone()]),
+        keys: vec![key.clone()],
+        files: [(key.clone(), video.clone())].into(),
+    };
+    let invite = ana_live.invite().clone();
+    let mut bia_live = Live::join(&invite, "novafilm", "Bia").unwrap();
+    // Bia "acha" que o documento também usa o segredo da Ana: o pedido não pode ser atendido.
+    let secret_key = secret.to_string_lossy().into_owned();
+    let mut bia = MediaApp {
+        doc: Doc::default(),
+        keys: vec![key.clone(), secret_key.clone()],
+        files: Default::default(),
+    };
+    let start = Instant::now();
+    while !bia.files.contains_key(&key) {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "a mídia não chegou"
+        );
+        ana_live.pump(&mut ana);
+        bia_live.pump(&mut bia);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&bia.files[&key]).unwrap(),
+        content,
+        "conteúdo idêntico"
+    );
+    assert!(
+        bia.files[&key].starts_with(dir.join("recebidas")),
+        "fica na pasta de mídias"
+    );
+    // Mais um tempo: o segredo (fora do documento da Ana) nunca chega.
+    let wait = Instant::now();
+    while wait.elapsed() < Duration::from_secs(2) {
+        ana_live.pump(&mut ana);
+        bia_live.pump(&mut bia);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !bia.files.contains_key(&secret_key),
+        "só sai o que o documento usa"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

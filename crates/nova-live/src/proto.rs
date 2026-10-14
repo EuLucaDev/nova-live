@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-/// Versão do protocolo. 2: anfitrião passa adiante ao sair, encerrar para todos, trocar o convite.
+/// Versão do protocolo. 2: anfitrião passa adiante ao sair, encerrar para todos, trocar o convite,
+/// troca de mídias (vídeos, áudios) entre os participantes.
 pub const PROTOCOL: u32 = 2;
 /// Versão mais antiga que o relay ainda aceita (apps não atualizados).
 pub const PROTOCOL_MIN: u32 = 1;
@@ -53,6 +54,17 @@ pub enum ClientMsg {
     End,
     /// Anfitrião: troca o segredo do convite; o link anterior deixa de valer para quem não entrou.
     NewToken { token: String },
+    /// Pede a todos a mídia `key` (usada pelo documento e que falta aqui).
+    WantMedia { key: String },
+    /// Um pedaço da mídia `key` para quem pediu (`to`). `digest` vem no último pedaço.
+    MediaChunk {
+        to: String,
+        key: String,
+        offset: u64,
+        total: u64,
+        data: String,
+        digest: Option<u64>,
+    },
 }
 
 /// Do relay para o app.
@@ -104,5 +116,19 @@ pub enum ServerMsg {
     /// O segredo do convite mudou (o anfitrião gerou um convite novo).
     Token {
         token: String,
+    },
+    /// Alguém (`from`) precisa da mídia `key`.
+    WantMedia {
+        from: String,
+        key: String,
+    },
+    /// Um pedaço da mídia `key`, enviado por `from`.
+    MediaChunk {
+        from: String,
+        key: String,
+        offset: u64,
+        total: u64,
+        data: String,
+        digest: Option<u64>,
     },
 }

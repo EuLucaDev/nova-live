@@ -24,11 +24,15 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod adapter;
+pub mod media;
 mod net;
 pub mod proto;
 
 pub use adapter::{Adapter, Change, Notice};
+pub use media::MediaProgress;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -190,14 +194,21 @@ pub fn random_id(bytes: usize) -> Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
 
-/// Impressão digital estável (FNV-1a 64) de bytes canônicos do documento.
-pub fn digest(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+/// Valor inicial da impressão digital (FNV-1a 64).
+pub(crate) const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Continua uma impressão digital FNV-1a 64 com mais bytes (arquivos em pedaços).
+pub(crate) fn digest_update(mut h: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// Impressão digital estável (FNV-1a 64) de bytes canônicos do documento.
+pub fn digest(bytes: &[u8]) -> u64 {
+    digest_update(DIGEST_SEED, bytes)
 }
 
 /// O que o app precisa fazer, vindo da sessão.
@@ -220,6 +231,17 @@ pub enum Event {
     Ended(String),
     /// Quem coordenava saiu e agora você é o anfitrião (entrega o documento a quem entrar).
     Promoted,
+    /// Alguém (`from`) pediu a mídia `key`.
+    MediaWanted { from: String, key: String },
+    /// Chegou um pedaço de mídia.
+    MediaChunk {
+        from: String,
+        key: String,
+        offset: u64,
+        total: u64,
+        data: String,
+        digest: Option<u64>,
+    },
 }
 
 /// Papel nesta sessão.
@@ -256,6 +278,10 @@ pub struct Live {
     replace_due: bool,
     last_replace: Option<Instant>,
     known: Vec<Peer>,
+    /// Mídias pedidas, recebendo e enviando.
+    pub(crate) media: media::MediaState,
+    /// Bytes de mídia na fila da thread de rede.
+    pub(crate) backlog: Arc<AtomicUsize>,
 }
 
 impl Live {
@@ -299,7 +325,8 @@ impl Live {
     }
 
     fn start(role: Role, invite: Invite, hello: ClientMsg) -> Result<Live> {
-        let (out, inbox) = net::spawn(&invite.server, hello)?;
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let (out, inbox) = net::spawn(&invite.server, hello, backlog.clone())?;
         Ok(Live {
             role,
             invite,
@@ -320,6 +347,8 @@ impl Live {
             replace_due: false,
             last_replace: None,
             known: vec![],
+            media: media::MediaState::default(),
+            backlog,
         })
     }
 
@@ -359,7 +388,7 @@ impl Live {
         Ok(self.invite.clone())
     }
 
-    fn send(&mut self, msg: ClientMsg) {
+    pub(crate) fn send(&mut self, msg: ClientMsg) {
         if self.out.send(msg).is_err() {
             self.ended = true;
         }
@@ -543,6 +572,22 @@ impl Live {
                     events.push(Event::Promoted);
                 }
             }
+            ServerMsg::WantMedia { from, key } => events.push(Event::MediaWanted { from, key }),
+            ServerMsg::MediaChunk {
+                from,
+                key,
+                offset,
+                total,
+                data,
+                digest,
+            } => events.push(Event::MediaChunk {
+                from,
+                key,
+                offset,
+                total,
+                data,
+                digest,
+            }),
             ServerMsg::Token { token } => {
                 if valid_id(&token, 16, 128) {
                     self.invite.token = token;

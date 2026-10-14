@@ -283,6 +283,40 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
                     r.broadcast(&ServerMsg::Token { token });
                 }
             }
+            ClientMsg::WantMedia { key } => {
+                if key.len() <= 4096 {
+                    for (id, m) in &r.members {
+                        if *id != me && m.protocol >= 2 {
+                            let _ = m.tx.send(ServerMsg::WantMedia {
+                                from: me.clone(),
+                                key: key.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            ClientMsg::MediaChunk {
+                to,
+                key,
+                offset,
+                total,
+                data,
+                digest,
+            } => {
+                if to != me {
+                    r.send_to(
+                        &to,
+                        ServerMsg::MediaChunk {
+                            from: me.clone(),
+                            key,
+                            offset,
+                            total,
+                            data,
+                            digest,
+                        },
+                    );
+                }
+            }
             ClientMsg::Bye => break,
             _ => {}
         }
