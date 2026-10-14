@@ -3,8 +3,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-/// Versão do protocolo; o relay recusa outra.
-pub const PROTOCOL: u32 = 1;
+/// Versão do protocolo. 2: anfitrião passa adiante ao sair, encerrar para todos, trocar o convite.
+pub const PROTOCOL: u32 = 2;
+/// Versão mais antiga que o relay ainda aceita (apps não atualizados).
+pub const PROTOCOL_MIN: u32 = 1;
 
 /// Maior mensagem aceita (um documento inteiro em base64 cabe nisso).
 pub const MAX_MESSAGE: usize = 256 << 20;
@@ -45,8 +47,12 @@ pub enum ClientMsg {
     Digest { rev: u64, digest: u64 },
     /// Convidado: pede o documento ao anfitrião.
     WantSnapshot,
-    /// Saída limpa.
+    /// Saída limpa. Se for o anfitrião, a sessão continua com o próximo participante.
     Bye,
+    /// Anfitrião: encerra a sessão para todos.
+    End,
+    /// Anfitrião: troca o segredo do convite; o link anterior deixa de valer para quem não entrou.
+    NewToken { token: String },
 }
 
 /// Do relay para o app.
@@ -92,5 +98,11 @@ pub enum ServerMsg {
     /// Entrada recusada (convite inválido, revogado, app errado…).
     Refused {
         reason: String,
+    },
+    /// Você passou a ser o anfitrião (o anterior saiu).
+    Promoted,
+    /// O segredo do convite mudou (o anfitrião gerou um convite novo).
+    Token {
+        token: String,
     },
 }

@@ -50,6 +50,8 @@ pub enum Notice {
     Left(String),
     Ended(String),
     Problem(String),
+    /// Quem coordenava saiu; esta pessoa passou a coordenar (a sessão continua).
+    Promoted,
 }
 
 /// Entre dois envios de documento inteiro, no máximo este intervalo (gestos longos).
@@ -89,6 +91,7 @@ impl Live {
                 },
                 Event::Peers(peers) => notices.extend(diff_peers(&self.known, &peers)),
                 Event::Ended(reason) => notices.push(Notice::Ended(reason)),
+                Event::Promoted => notices.push(Notice::Promoted),
             }
         }
         self.known = self.peers().to_vec();

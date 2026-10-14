@@ -2,8 +2,10 @@
 //!
 //! Uma sala por documento compartilhado. O anfitrião cria a sala com o segredo de convidado e o
 //! próprio segredo; convidados entram com o segredo do convite. O relay numera cada alteração
-//! (ordem total), repassa a todos, entrega o documento do anfitrião a quem entra e encerra a sala
-//! quando o anfitrião sai. Não guarda documentos em disco nem tem catálogo de salas.
+//! (ordem total), repassa a todos e entrega o documento do anfitrião a quem entra. Quando o
+//! anfitrião sai (ou cai), o próximo participante vira anfitrião e a sessão continua; só
+//! "encerrar" (ou a saída do último) fecha a sala. O anfitrião pode trocar o segredo do convite.
+//! Não guarda documentos em disco nem tem catálogo de salas.
 //! Sem limite de participantes; limite apenas de tamanho de mensagem.
 //!
 //! O binário (`main.rs`) só escuta e chama [`run`]. TLS fica no proxy (Traefik/Coolify).
@@ -15,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use nova_live::proto::{ClientMsg, MAX_MESSAGE, PROTOCOL, Peer, ServerMsg};
+use nova_live::proto::{ClientMsg, MAX_MESSAGE, PROTOCOL, PROTOCOL_MIN, Peer, ServerMsg};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
@@ -27,6 +29,8 @@ type Tx = mpsc::UnboundedSender<ServerMsg>;
 struct Member {
     peer: Peer,
     tx: Tx,
+    /// Versão do protocolo do app: só quem entende `Promoted` pode virar anfitrião.
+    protocol: u32,
 }
 
 struct Room {
@@ -73,6 +77,12 @@ fn same(a: &str, b: &str) -> bool {
             .zip(b.bytes())
             .fold(0u8, |acc, (x, y)| acc | (x ^ y))
             == 0
+}
+
+fn valid_secret(s: &str) -> bool {
+    (16..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn clean_name(name: &str) -> String {
@@ -162,7 +172,7 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
     else {
         return;
     };
-    if protocol != PROTOCOL {
+    if !(PROTOCOL_MIN..=PROTOCOL).contains(&protocol) {
         let _ = tx.send(ServerMsg::Refused {
             reason: "versão do app diferente da do servidor: atualize o app pelo launcher".into(),
         });
@@ -176,6 +186,7 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
         host_token.as_deref(),
         &clean_name(&name),
         tx.clone(),
+        protocol,
     )
     .await
     {
@@ -254,6 +265,24 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
                     r.send_to(&h, ServerMsg::WantSnapshot);
                 }
             }
+            ClientMsg::End if is_host => {
+                let who = r
+                    .members
+                    .get(&me)
+                    .map(|m| m.peer.name.clone())
+                    .unwrap_or_default();
+                r.broadcast(&ServerMsg::Ended {
+                    reason: format!("{who} encerrou a sessão."),
+                });
+                st.rooms.remove(&room);
+                break;
+            }
+            ClientMsg::NewToken { token } if is_host => {
+                if valid_secret(&token) {
+                    r.token = token.clone();
+                    r.broadcast(&ServerMsg::Token { token });
+                }
+            }
             ClientMsg::Bye => break,
             _ => {}
         }
@@ -271,6 +300,7 @@ async fn join(
     host_token: Option<&str>,
     name: &str,
     tx: Tx,
+    protocol: u32,
 ) -> Result<String, String> {
     if room.len() < 16 || room.len() > 64 || token.len() < 16 || token.len() > 128 {
         return Err("convite inválido".into());
@@ -306,6 +336,7 @@ async fn join(
                         host: true,
                     },
                     tx,
+                    protocol,
                 },
             );
             r.order.push(id.clone());
@@ -334,6 +365,7 @@ async fn join(
                         host: false,
                     },
                     tx,
+                    protocol,
                 },
             );
             r.order.push(id.clone());
@@ -362,15 +394,42 @@ async fn leave(state: &Shared, room: &str, me: &str) {
     let Some(r) = st.rooms.get_mut(room) else {
         return;
     };
+    let name = r
+        .members
+        .get(me)
+        .map(|m| m.peer.name.clone())
+        .unwrap_or_default();
     r.members.remove(me);
     r.order.retain(|x| x != me);
     r.awaiting.remove(me);
-    if r.host.as_deref() == Some(me) {
-        r.broadcast(&ServerMsg::Ended {
-            reason: "O anfitrião encerrou a sessão.".into(),
-        });
-        st.rooms.remove(room);
-    } else {
+    if r.host.as_deref() != Some(me) {
         r.broadcast(&ServerMsg::Peers { peers: r.peers() });
+        return;
+    }
+    // O anfitrião saiu: o participante mais antigo que entende o protocolo novo assume.
+    let next = r
+        .order
+        .iter()
+        .find(|id| r.members.get(*id).is_some_and(|m| m.protocol >= 2))
+        .cloned();
+    match next {
+        Some(id) => {
+            r.host = Some(id.clone());
+            if let Some(m) = r.members.get_mut(&id) {
+                m.peer.host = true;
+            }
+            r.awaiting.remove(&id);
+            r.send_to(&id, ServerMsg::Promoted);
+            if !r.awaiting.is_empty() {
+                r.send_to(&id, ServerMsg::WantSnapshot);
+            }
+            r.broadcast(&ServerMsg::Peers { peers: r.peers() });
+        }
+        None => {
+            r.broadcast(&ServerMsg::Ended {
+                reason: format!("{name} saiu e a sessão terminou."),
+            });
+            st.rooms.remove(room);
+        }
     }
 }

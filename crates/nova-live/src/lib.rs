@@ -218,6 +218,8 @@ pub enum Event {
     Peers(Vec<Peer>),
     /// A sessão terminou (motivo para mostrar).
     Ended(String),
+    /// Quem coordenava saiu e agora você é o anfitrião (entrega o documento a quem entrar).
+    Promoted,
 }
 
 /// Papel nesta sessão.
@@ -332,6 +334,29 @@ impl Live {
     }
     pub fn is_ended(&self) -> bool {
         self.ended
+    }
+
+    /// Anfitrião: encerra a sessão para todos (sair sem encerrar é só soltar a sessão: outro
+    /// participante assume).
+    pub fn end(&mut self) {
+        if self.role == Role::Host {
+            self.send(ClientMsg::End);
+        }
+        self.ended = true;
+    }
+
+    /// Anfitrião: gera um convite novo. O anterior deixa de valer para quem ainda não entrou;
+    /// quem já está na sessão continua.
+    pub fn renew_invite(&mut self) -> Result<Invite> {
+        if self.role != Role::Host {
+            return Err(err("só o anfitrião troca o convite"));
+        }
+        let token = random_id(18)?;
+        self.send(ClientMsg::NewToken {
+            token: token.clone(),
+        });
+        self.invite.token = token;
+        Ok(self.invite.clone())
     }
 
     fn send(&mut self, msg: ClientMsg) {
@@ -507,6 +532,20 @@ impl Live {
             ServerMsg::Digest { rev, digest } => {
                 if self.role == Role::Guest {
                     self.check = Some((rev, digest));
+                }
+            }
+            ServerMsg::Promoted => {
+                if self.role == Role::Guest {
+                    self.role = Role::Host;
+                    self.loaded = true;
+                    self.check = None;
+                    self.digest_sent_for = 0;
+                    events.push(Event::Promoted);
+                }
+            }
+            ServerMsg::Token { token } => {
+                if valid_id(&token, 16, 128) {
+                    self.invite.token = token;
                 }
             }
             ServerMsg::Ended { reason } | ServerMsg::Refused { reason } => {
