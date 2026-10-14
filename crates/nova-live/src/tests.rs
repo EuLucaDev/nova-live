@@ -52,3 +52,28 @@ fn digest_is_stable() {
     assert_eq!(digest(b"nova"), digest(b"nova"));
     assert_ne!(digest(b"nova"), digest(b"novb"));
 }
+
+#[test]
+fn invitations_reject_foreign_wrappers_and_credential_bearing_endpoints() {
+    let i = sample();
+    assert!(
+        Invite::parse(
+            &i.to_share_link()
+                .replace(JOIN_PAGE, "https://example.org/invite")
+        )
+        .is_err()
+    );
+    for server in [
+        "wss://user:password@live.agcunae.com/",
+        "wss://live.agcunae.com/?token=x",
+        "wss://live.agcunae.com/#x",
+        "wss://",
+        "wss://live.agcunae.com:0/",
+    ] {
+        let bad = Invite {
+            server: server.into(),
+            ..i.clone()
+        };
+        assert!(Invite::parse(&bad.to_link()).is_err());
+    }
+}

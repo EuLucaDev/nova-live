@@ -140,8 +140,8 @@ impl Invite {
         if s.len() > 4096 {
             return Err(err("convite longo demais"));
         }
-        let link = if let Some(i) = s.find("#invite=") {
-            dec(s.get(i + 8..).unwrap_or_default()).ok_or_else(|| err("convite inválido"))?
+        let link = if let Some(encoded) = s.strip_prefix(&format!("{JOIN_PAGE}#invite=")) {
+            dec(encoded).ok_or_else(|| err("convite inválido"))?
         } else {
             s.to_string()
         };
@@ -171,7 +171,7 @@ impl Invite {
         if !valid_id(&app, 2, 40) || !valid_id(&room, 16, 64) || !valid_id(&token, 16, 128) {
             return Err(err("convite inválido"));
         }
-        if !(server.starts_with("wss://") || server.starts_with("ws://")) || server.len() > 300 {
+        if server.len() > 300 || net::validate_server(&server).is_err() {
             return Err(err("servidor do convite inválido"));
         }
         Ok(Invite {

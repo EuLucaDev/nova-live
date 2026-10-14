@@ -32,16 +32,21 @@ fn parse(server: &str) -> Result<Target> {
     } else {
         return Err(err("o servidor precisa começar com wss:// ou ws://"));
     };
-    let authority = rest.split('/').next().unwrap_or_default();
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => (
-            h.trim_matches(|c| c == '[' || c == ']').to_string(),
-            p.parse().map_err(|_| err("porta inválida no servidor"))?,
-        ),
-        _ => (authority.to_string(), if secure { 443 } else { 80 }),
-    };
-    if host.is_empty() {
-        return Err(err("servidor sem endereço"));
+    let uri: tungstenite::http::Uri = server
+        .parse()
+        .map_err(|_| err("endereço inválido no servidor"))?;
+    if rest.contains(['@', '?', '#']) || rest.chars().any(char::is_whitespace) {
+        return Err(err("endereço inválido no servidor"));
+    }
+    let host = uri
+        .host()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| err("servidor sem endereço"))?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+    if port == 0 {
+        return Err(err("porta inválida no servidor"));
     }
     Ok(Target {
         secure,
@@ -49,6 +54,10 @@ fn parse(server: &str) -> Result<Target> {
         port,
         url: server.to_string(),
     })
+}
+
+pub(crate) fn validate_server(server: &str) -> Result<()> {
+    parse(server).map(|_| ())
 }
 
 /// Fluxo TLS ou simples, com leitura e escrita pelo mesmo dono.
