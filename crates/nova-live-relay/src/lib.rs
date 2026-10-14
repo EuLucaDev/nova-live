@@ -292,6 +292,7 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
     let _ = writer.await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn join(
     state: &Shared,
     app: &str,
