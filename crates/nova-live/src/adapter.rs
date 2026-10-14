@@ -139,6 +139,7 @@ impl Live {
         if !self.is_ended() {
             self.media_scan(app);
             self.media_send();
+            self.cursor_flush();
         }
         if !app.busy() {
             match self.role() {

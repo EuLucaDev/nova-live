@@ -417,3 +417,34 @@ fn media_the_document_uses_reaches_the_guest_and_nothing_else_leaves() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn each_person_sees_the_others_mouse_with_name_and_colour() {
+    let server = relay();
+    let mut ana = Client::new(
+        Live::host("novafig", &server, "Ana").unwrap(),
+        Doc(vec!["a".into()]),
+    );
+    let invite = ana.live.invite().clone();
+    let mut bia = Client::new(
+        Live::join(&invite, "novafig", "Bia").unwrap(),
+        Doc::default(),
+    );
+    wait(&mut [&mut ana, &mut bia], "entrada", |c| {
+        c[1].app.doc.0.len() == 1
+    });
+    ana.live.set_cursor(Some(("pagina-1".into(), 120.5, 40.0)));
+    wait(&mut [&mut ana, &mut bia], "mouse da Ana chega", |c| {
+        c[1].live
+            .cursors()
+            .iter()
+            .any(|m| m.name == "Ana" && m.space == "pagina-1" && m.x == 120.5)
+    });
+    let m = &bia.live.cursors()[0];
+    assert_eq!(m.color, nova_live::cursors::color_for("Ana"));
+    assert!(ana.live.cursors().is_empty(), "ninguém vê o próprio mouse");
+    ana.live.set_cursor(None);
+    wait(&mut [&mut ana, &mut bia], "mouse sai", |c| {
+        c[1].live.cursors().is_empty()
+    });
+}

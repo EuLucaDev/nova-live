@@ -56,6 +56,11 @@ pub enum ClientMsg {
     NewToken { token: String },
     /// Pede a todos a mídia `key` (usada pelo documento e que falta aqui).
     WantMedia { key: String },
+    /// Onde está o mouse desta pessoa no documento (`space`: página, aba, sequência… em que ela
+    /// está olhando; `x`, `y` nas coordenadas do documento). Não entra na ordem das alterações.
+    Cursor { space: String, x: f64, y: f64 },
+    /// O mouse saiu do documento.
+    CursorGone,
     /// Um pedaço da mídia `key` para quem pediu (`to`). `digest` vem no último pedaço.
     MediaChunk {
         to: String,
@@ -116,6 +121,17 @@ pub enum ServerMsg {
     /// O segredo do convite mudou (o anfitrião gerou um convite novo).
     Token {
         token: String,
+    },
+    /// O mouse de `from` no documento.
+    Cursor {
+        from: String,
+        space: String,
+        x: f64,
+        y: f64,
+    },
+    /// O mouse de `from` saiu do documento.
+    CursorGone {
+        from: String,
     },
     /// Alguém (`from`) precisa da mídia `key`.
     WantMedia {

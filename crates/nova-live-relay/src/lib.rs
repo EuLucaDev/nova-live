@@ -283,6 +283,29 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
                     r.broadcast(&ServerMsg::Token { token });
                 }
             }
+            ClientMsg::Cursor { space, x, y } => {
+                if space.len() <= 256 && x.is_finite() && y.is_finite() {
+                    let m = ServerMsg::Cursor {
+                        from: me.clone(),
+                        space,
+                        x,
+                        y,
+                    };
+                    for (id, member) in &r.members {
+                        if *id != me {
+                            let _ = member.tx.send(m.clone());
+                        }
+                    }
+                }
+            }
+            ClientMsg::CursorGone => {
+                let m = ServerMsg::CursorGone { from: me.clone() };
+                for (id, member) in &r.members {
+                    if *id != me {
+                        let _ = member.tx.send(m.clone());
+                    }
+                }
+            }
             ClientMsg::WantMedia { key } => {
                 if key.len() <= 4096 {
                     for (id, m) in &r.members {

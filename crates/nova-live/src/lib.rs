@@ -24,13 +24,16 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod account;
 mod adapter;
+pub mod cursors;
 pub mod links;
 pub mod media;
 mod net;
 pub mod proto;
 
 pub use adapter::{Adapter, Change, Notice};
+pub use cursors::RemoteCursor;
 pub use media::MediaProgress;
 
 use std::sync::Arc;
@@ -80,7 +83,7 @@ pub struct Invite {
     pub token: String,
 }
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
@@ -92,7 +95,7 @@ fn enc(s: &str) -> String {
     out
 }
 
-fn dec(s: &str) -> Option<String> {
+pub(crate) fn dec(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -165,6 +168,10 @@ impl Invite {
                 .split_once('=')
                 .ok_or_else(|| err("convite inválido"))?;
             let v = dec(v).ok_or_else(|| err("convite inválido"))?;
+            if k == "name" {
+                // Nome da conta Nova Foods de quem abriu o convite pelo site (guardado pelo app).
+                continue;
+            }
             let slot = match k {
                 "app" => &mut app,
                 "server" => &mut server,
@@ -292,6 +299,8 @@ pub struct Live {
     pub(crate) media: media::MediaState,
     /// Bytes de mídia na fila da thread de rede.
     pub(crate) backlog: Arc<AtomicUsize>,
+    /// Mouses (o meu e os dos colegas).
+    pub(crate) cursors: cursors::CursorState,
 }
 
 impl Live {
@@ -359,6 +368,7 @@ impl Live {
             known: vec![],
             media: media::MediaState::default(),
             backlog,
+            cursors: cursors::CursorState::default(),
         })
     }
 
@@ -582,6 +592,8 @@ impl Live {
                     events.push(Event::Promoted);
                 }
             }
+            ServerMsg::Cursor { from, space, x, y } => self.cursor_seen(from, Some((space, x, y))),
+            ServerMsg::CursorGone { from } => self.cursor_seen(from, None),
             ServerMsg::WantMedia { from, key } => events.push(Event::MediaWanted { from, key }),
             ServerMsg::MediaChunk {
                 from,
