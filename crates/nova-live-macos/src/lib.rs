@@ -11,6 +11,14 @@
 use std::sync::Mutex;
 
 static QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Acorda a interface quando um link chega (a janela parada não desenha quadros sozinha).
+type Waker = Box<dyn Fn() + Send>;
+static WAKER: Mutex<Option<Waker>> = Mutex::new(None);
+
+/// O que chamar quando um link chegar (por exemplo, pedir um quadro novo à interface).
+pub fn set_waker(waker: impl Fn() + Send + 'static) {
+    *WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(waker));
+}
 
 /// Links recebidos desde a última chamada.
 pub fn take() -> Vec<String> {
@@ -21,6 +29,9 @@ fn push(url: String) {
     // Um link de convite é curto; qualquer coisa enorme é descartada.
     if url.len() <= 8192 {
         QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(url);
+        if let Some(wake) = WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            wake();
+        }
     }
 }
 

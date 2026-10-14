@@ -19,6 +19,15 @@ pub fn install() {
     nova_live_macos::install();
 }
 
+/// O que chamar quando um link chegar com o app aberto (macOS): em geral, pedir um quadro novo à
+/// interface, que lê os links com [`take`].
+pub fn set_waker(waker: impl Fn() + Send + 'static) {
+    #[cfg(target_os = "macos")]
+    nova_live_macos::set_waker(waker);
+    #[cfg(not(target_os = "macos"))]
+    let _ = waker;
+}
+
 /// Links recebidos desde a última chamada.
 pub fn take() -> Vec<String> {
     #[cfg(target_os = "macos")]
