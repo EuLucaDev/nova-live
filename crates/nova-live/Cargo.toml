@@ -18,3 +18,6 @@ webpki-roots = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nova-live-macos = { path = "../nova-live-macos" }
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"

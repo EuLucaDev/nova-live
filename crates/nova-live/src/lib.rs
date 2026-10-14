@@ -25,6 +25,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod adapter;
+pub mod links;
 pub mod media;
 mod net;
 pub mod proto;
@@ -193,25 +194,6 @@ impl Invite {
             room,
             token,
         })
-    }
-}
-
-/// Links de convite que o sistema entrega ao app. No Windows e no Linux chegam na linha de
-/// comando; no macOS chegam como evento, e [`links::install`] precisa ser chamado no início do
-/// programa para recebê-los ([`links::take`] a cada quadro).
-pub mod links {
-    /// Registra o recebimento de links (macOS); nos outros sistemas não faz nada.
-    pub fn install() {
-        #[cfg(target_os = "macos")]
-        nova_live_macos::install();
-    }
-
-    /// Links recebidos desde a última chamada.
-    pub fn take() -> Vec<String> {
-        #[cfg(target_os = "macos")]
-        return nova_live_macos::take();
-        #[cfg(not(target_os = "macos"))]
-        Vec::new()
     }
 }
 
