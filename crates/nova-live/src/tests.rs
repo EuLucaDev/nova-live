@@ -17,7 +17,7 @@ fn invite_links_round_trip() {
     assert_eq!(Invite::parse(&i.to_link()).unwrap(), i);
     let share = i.to_share_link();
     assert!(
-        share.starts_with("https://workflowind.agcunae.com/apps/join#invite=novalive%3A%2F%2Fjoin")
+        share.starts_with("https://workflowind.agcunae.com/apps/join#invite=novagrid%3A%2F%2Fjoin")
     );
     assert_eq!(Invite::parse(&share).unwrap(), i);
     assert_eq!(Invite::parse(&format!("  {share}\n")).unwrap(), i);
@@ -78,4 +78,19 @@ fn invitations_reject_foreign_wrappers_and_credential_bearing_endpoints() {
         };
         assert!(Invite::parse(&bad.to_link()).is_err());
     }
+}
+
+#[test]
+fn each_app_has_its_own_link_and_old_links_still_work() {
+    let i = sample();
+    assert!(i.to_link().starts_with("novagrid://join?app=novagrid&"));
+    let old = i.to_link().replacen("novagrid://", "novalive://", 1);
+    assert_eq!(Invite::parse(&old).unwrap(), i);
+    // O esquema precisa ser o do app do convite.
+    assert!(Invite::parse(&i.to_link().replacen("novagrid://", "novaword://", 1)).is_err());
+    assert!(Invite::parse(&i.to_link().replacen("novagrid://", "java script://", 1)).is_err());
+    assert_eq!(
+        Invite::parse(&i.to_link().replacen("novagrid://", "NovaGrid://", 1)).unwrap(),
+        i
+    );
 }

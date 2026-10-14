@@ -1,0 +1,12 @@
+[package]
+name = "nova-live-macos"
+description = "Recebe no macOS os links de convite (Apple Event GetURL) para os apps Nova Foods"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSObject"] }

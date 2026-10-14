@@ -13,8 +13,9 @@
 //! - Mudanças que não são comandos (desfazer, refazer, abrir outro arquivo) seguem como
 //!   documento inteiro (`replace`).
 //!
-//! Convites: `novalive://join?app=<app>&server=<wss>&room=<id>&token=<segredo>`, ou o mesmo
-//! dentro de `https://workflowind.agcunae.com/apps/join#invite=<link>` (o segredo fica no
+//! Convites: `<app>://join?app=<app>&server=<wss>&room=<id>&token=<segredo>` (o esquema é o do
+//! app, `novagrid://…`, para o sistema abrir o app certo; `novalive://…` antigo também vale), ou o
+//! mesmo dentro de `https://workflowind.agcunae.com/apps/join#invite=<link>` (o segredo fica no
 //! fragmento e não chega a nenhum servidor web). Um convite vale para um documento de um app.
 //!
 //! A biblioteca não usa runtime assíncrono: uma thread de rede por sessão, e o app chama
@@ -122,10 +123,11 @@ fn valid_id(s: &str, min: usize, max: usize) -> bool {
 }
 
 impl Invite {
-    /// `novalive://join?…`: o link que o app entende.
+    /// `<app>://join?…`: o link que abre o app (o sistema escolhe o app pelo esquema).
     pub fn to_link(&self) -> String {
         format!(
-            "novalive://join?app={}&server={}&room={}&token={}",
+            "{}://join?app={}&server={}&room={}&token={}",
+            self.app,
             enc(&self.app),
             enc(&self.server),
             enc(&self.room),
@@ -149,9 +151,13 @@ impl Invite {
         } else {
             s.to_string()
         };
-        let query = link
-            .strip_prefix("novalive://join?")
+        let (scheme, query) = link
+            .split_once("://join?")
             .ok_or_else(|| err("isto não é um convite Nova Live"))?;
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme != "novalive" && !valid_id(&scheme, 2, 40) {
+            return Err(err("isto não é um convite Nova Live"));
+        }
         let (mut app, mut server, mut room, mut token) = (None, None, None, None);
         for pair in query.split('&') {
             let (k, v) = pair
@@ -172,6 +178,9 @@ impl Invite {
         let (Some(app), Some(server), Some(room), Some(token)) = (app, server, room, token) else {
             return Err(err("convite incompleto"));
         };
+        if scheme != "novalive" && scheme != app {
+            return Err(err("convite inválido"));
+        }
         if !valid_id(&app, 2, 40) || !valid_id(&room, 16, 64) || !valid_id(&token, 16, 128) {
             return Err(err("convite inválido"));
         }
@@ -184,6 +193,25 @@ impl Invite {
             room,
             token,
         })
+    }
+}
+
+/// Links de convite que o sistema entrega ao app. No Windows e no Linux chegam na linha de
+/// comando; no macOS chegam como evento, e [`links::install`] precisa ser chamado no início do
+/// programa para recebê-los ([`links::take`] a cada quadro).
+pub mod links {
+    /// Registra o recebimento de links (macOS); nos outros sistemas não faz nada.
+    pub fn install() {
+        #[cfg(target_os = "macos")]
+        nova_live_macos::install();
+    }
+
+    /// Links recebidos desde a última chamada.
+    pub fn take() -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        return nova_live_macos::take();
+        #[cfg(not(target_os = "macos"))]
+        Vec::new()
     }
 }
 
