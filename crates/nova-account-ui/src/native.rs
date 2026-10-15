@@ -324,43 +324,6 @@ pub struct Presence {
     pub host: bool,
 }
 
-/// Avatares e ação principal compacta; nomes reais estão disponíveis no hover e na lista.
-pub fn share_button(ui: &mut Ui, people: &[Presence], active: bool) -> Response {
-    let me = identity::profile();
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        if let Some(me) = &me {
-            avatar(ui, Some(&me.user.id), &me.user.name, 27.0);
-            for person in people
-                .iter()
-                .filter(|person| person.user_id.as_deref() != Some(me.user.id.as_str()))
-                .take(2)
-            {
-                avatar(ui, person.user_id.as_deref(), &person.name, 27.0);
-            }
-        }
-        let label = "Compartilhar";
-        ui.add(
-            egui::Button::new(
-                RichText::new(label)
-                    .size(12.5)
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(BLUE)
-            .stroke(Stroke::NONE)
-            .corner_radius(16)
-            .min_size(vec2(112.0, 32.0)),
-        )
-        .on_hover_text(if active {
-            "Pessoas e convite deste arquivo"
-        } else {
-            "Convidar pessoas para editar este arquivo"
-        })
-    })
-    .inner
-}
-
 pub fn account_panel(ui: &mut Ui, app: &str) {
     match identity::status(app) {
         Status::Verified(profile) => {
