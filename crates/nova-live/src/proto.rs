@@ -18,6 +18,9 @@ pub struct Peer {
     pub id: String,
     pub name: String,
     pub host: bool,
+    /// Identidade confirmada pelo servidor; o cliente não escolhe este id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// Do app para o relay.

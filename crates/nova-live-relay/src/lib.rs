@@ -15,8 +15,10 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use nova_live::identity::{self, Profile};
 use nova_live::proto::{ClientMsg, MAX_MESSAGE, PROTOCOL, PROTOCOL_MIN, Peer, ServerMsg};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -35,6 +37,7 @@ struct Member {
 
 struct Room {
     app: String,
+    organization_id: Option<String>,
     token: String,
     host_token: String,
     host: Option<String>,
@@ -86,13 +89,26 @@ fn valid_secret(s: &str) -> bool {
 }
 
 fn clean_name(name: &str) -> String {
-    let n: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+    let n: String = name.chars().filter(|c| !c.is_control()).take(160).collect();
     let n = n.trim().to_string();
     if n.is_empty() { "Convidado".into() } else { n }
 }
 
 /// Atende conexões para sempre.
 pub async fn run(listener: TcpListener) {
+    run_inner(listener, true).await;
+}
+
+/// Apenas builds de desenvolvimento podem hospedar testes locais sem conta.
+#[cfg(debug_assertions)]
+pub async fn run_local(listener: TcpListener) {
+    if !listener.local_addr().is_ok_and(|a| a.ip().is_loopback()) {
+        return;
+    }
+    run_inner(listener, false).await;
+}
+
+async fn run_inner(listener: TcpListener, account_required: bool) {
     let state: Shared = Arc::default();
     loop {
         let Ok((stream, addr)) = listener.accept().await else {
@@ -100,13 +116,13 @@ pub async fn run(listener: TcpListener) {
         };
         let state = state.clone();
         tokio::spawn(async move {
-            serve(stream, addr, state).await;
+            serve(stream, addr, state, account_required).await;
         });
     }
 }
 
 /// `GET …/healthz` responde 200; o resto vira WebSocket.
-async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
+async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_required: bool) {
     let mut buf = [0u8; 512];
     let n = stream.peek(&mut buf).await.unwrap_or(0);
     let head = String::from_utf8_lossy(&buf[..n]);
@@ -124,7 +140,22 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
     let mut cfg = WebSocketConfig::default();
     cfg.max_message_size = Some(MAX_MESSAGE);
     cfg.max_frame_size = Some(MAX_MESSAGE);
-    let Ok(ws) = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await else {
+    let mut account_token: Option<String> = None;
+    let capture_account =
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            account_token = request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .filter(|v| v.len() == 43)
+                .map(str::to_string);
+            Ok(response)
+        };
+    let Ok(ws) =
+        tokio_tungstenite::accept_hdr_async_with_config(stream, capture_account, Some(cfg)).await
+    else {
         return;
     };
     let (mut sink, mut source) = ws.split();
@@ -178,6 +209,26 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
         });
         return;
     }
+    let mut account = if account_required {
+        let Some(token) = account_token.clone() else {
+            let _ = tx.send(ServerMsg::Refused {
+                reason: "Conecte sua conta Nova Foods pelo launcher para colaborar.".into(),
+            });
+            return;
+        };
+        match tokio::task::spawn_blocking(move || identity::validate_token(&token)).await {
+            Ok(Ok(profile)) if profile.allows(&app) => Some(profile),
+            _ => {
+                let _ = tx.send(ServerMsg::Refused {
+                    reason: "Sua conta não tem acesso a este aplicativo ou a conexão expirou."
+                        .into(),
+                });
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let me = match join(
         &state,
         &app,
@@ -185,6 +236,7 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
         &token,
         host_token.as_deref(),
         &clean_name(&name),
+        account.as_ref(),
         tx.clone(),
         protocol,
     )
@@ -198,7 +250,38 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared) {
         }
     };
 
-    while let Some(frame) = source.next().await {
+    let mut lease = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    loop {
+        let frame = if account_required {
+            tokio::select! {
+                frame = source.next() => frame,
+                _ = lease.tick() => {
+                    let token = account_token.clone().unwrap_or_default();
+                    let checked = tokio::task::spawn_blocking(move || identity::validate_token(&token)).await;
+                    let valid = match (&account, checked) {
+                        (Some(previous), Ok(Ok(profile))) if profile.allows(&app) && profile.user.id == previous.user.id && profile.organization.id == previous.organization.id => Some(profile),
+                        _ => None,
+                    };
+                    let Some(profile) = valid else {
+                        let _ = tx.send(ServerMsg::Refused { reason: "Seu acesso mudou ou sua conta desconectou. Conecte novamente pelo launcher.".into() });
+                        break;
+                    };
+                    let mut st = state.lock().await;
+                    if let Some(room) = st.rooms.get_mut(&room) {
+                        if let Some(member) = room.members.get_mut(&me) { member.peer.name = clean_name(&profile.user.name); }
+                        room.broadcast(&ServerMsg::Peers { peers: room.peers() });
+                    }
+                    account = Some(profile);
+                    continue;
+                }
+            }
+        } else {
+            source.next().await
+        };
+        let Some(frame) = frame else { break };
         let text = match frame {
             Ok(Message::Text(t)) => t,
             Ok(Message::Close(_)) | Err(_) => break,
@@ -357,13 +440,22 @@ async fn join(
     token: &str,
     host_token: Option<&str>,
     name: &str,
+    account: Option<&Profile>,
     tx: Tx,
     protocol: u32,
 ) -> Result<String, String> {
     if room.len() < 16 || room.len() > 64 || token.len() < 16 || token.len() > 128 {
         return Err("convite inválido".into());
     }
+    if account.is_some_and(|profile| !profile.allows(app)) {
+        return Err("Aplicativo não liberado para esta conta.".into());
+    }
     let mut st = state.lock().await;
+    let organization_id = account.map(|p| p.organization.id.clone());
+    let user_id = account.map(|p| p.user.id.clone());
+    let name = account
+        .map(|p| clean_name(&p.user.name))
+        .unwrap_or_else(|| clean_name(name));
     st.next += 1;
     let id = format!("p{}", st.next);
     match host_token {
@@ -373,6 +465,7 @@ async fn join(
             }
             let r = st.rooms.entry(room.to_string()).or_insert_with(|| Room {
                 app: app.to_string(),
+                organization_id: organization_id.clone(),
                 token: token.to_string(),
                 host_token: ht.to_string(),
                 host: None,
@@ -381,7 +474,11 @@ async fn join(
                 rev: 0,
                 awaiting: HashSet::new(),
             });
-            if !same(&r.host_token, ht) || r.app != app || r.host.is_some() {
+            if !same(&r.host_token, ht)
+                || r.app != app
+                || r.host.is_some()
+                || r.organization_id != organization_id
+            {
                 return Err("esta sessão já tem anfitrião".into());
             }
             r.host = Some(id.clone());
@@ -392,6 +489,7 @@ async fn join(
                         id: id.clone(),
                         name: name.to_string(),
                         host: true,
+                        user_id: user_id.clone(),
                     },
                     tx,
                     protocol,
@@ -411,6 +509,9 @@ async fn join(
             if r.app != app {
                 return Err(format!("este convite é do app {}", r.app));
             }
+            if r.organization_id != organization_id {
+                return Err("Este convite pertence a outra organização.".into());
+            }
             if !same(&r.token, token) {
                 return Err("convite inválido".into());
             }
@@ -421,6 +522,7 @@ async fn join(
                         id: id.clone(),
                         name: name.to_string(),
                         host: false,
+                        user_id,
                     },
                     tx,
                     protocol,
@@ -489,5 +591,77 @@ async fn leave(state: &Shared, room: &str, me: &str) {
             });
             st.rooms.remove(room);
         }
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    fn profile(org: &str, apps: &[&str]) -> Profile {
+        serde_json::from_value(serde_json::json!({
+            "user": {"id":"person-1", "name":"Ana Oliveira", "avatarUrl":null},
+            "organization":{"id":org,"name":"Nova Foods"}, "departments":[],
+            "apps":apps, "policyEnabled":true,"canManage":false
+        }))
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn canonical_identity_and_organization_are_enforced() {
+        let state: Shared = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let person = profile("org-1", &["novaphoto"]);
+        let id = join(
+            &state,
+            "novaphoto",
+            "room-123456789012",
+            "token-123456789012",
+            Some("host-123456789012"),
+            "LPC",
+            Some(&person),
+            tx,
+            PROTOCOL,
+        )
+        .await
+        .unwrap();
+        {
+            let locked = state.lock().await;
+            let peer = &locked.rooms["room-123456789012"].members[&id].peer;
+            assert_eq!(peer.name, "Ana Oliveira");
+            assert_eq!(peer.user_id.as_deref(), Some("person-1"));
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let outsider = profile("org-2", &["novaphoto"]);
+        assert!(
+            join(
+                &state,
+                "novaphoto",
+                "room-123456789012",
+                "token-123456789012",
+                None,
+                "Ana",
+                Some(&outsider),
+                tx,
+                PROTOCOL
+            )
+            .await
+            .is_err()
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let denied = profile("org-1", &["novaword"]);
+        assert!(
+            join(
+                &state,
+                "novaphoto",
+                "room-123456789012",
+                "token-123456789012",
+                None,
+                "Ana",
+                Some(&denied),
+                tx,
+                PROTOCOL
+            )
+            .await
+            .is_err()
+        );
     }
 }

@@ -1,8 +1,8 @@
 //! A conta Nova Foods desta pessoa, compartilhada por todos os apps: o nome que os colegas veem
 //! na sessão e na etiqueta do mouse.
 //!
-//! Fica em `<configuração>/NovaFoods/account.json`. Chega pelo site: ao abrir um convite com a
-//! conta entrada, ou em "Usar minha conta Nova Foods" (o site abre `<app>://account?name=…`).
+//! A conexão real fica no módulo `identity`: código de uso único e sessão validada no site.
+//! Os parsers legados reconhecem convites antigos, mas nomes em links não autenticam ninguém.
 
 use std::path::PathBuf;
 
@@ -26,6 +26,10 @@ fn dir() -> Option<PathBuf> {
     Some(base?.join("NovaFoods"))
 }
 
+pub(crate) fn config_dir() -> Option<PathBuf> {
+    dir()
+}
+
 /// Nome limpo: sem controles, até 64 caracteres.
 pub fn clean(name: &str) -> Option<String> {
     let n: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
@@ -35,40 +39,20 @@ pub fn clean(name: &str) -> Option<String> {
 
 /// O nome da conta Nova Foods, se esta pessoa já conectou.
 pub fn account_name() -> Option<String> {
-    account_name_in(&dir()?)
-}
-
-fn account_name_in(dir: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("account.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    clean(v.get("name")?.as_str()?)
+    crate::identity::profile().map(|profile| profile.user.name)
 }
 
 /// Guarda o nome da conta (vale para todos os apps).
 pub fn save_account_name(name: &str) -> crate::Result<String> {
-    let d = dir().ok_or_else(|| crate::Error("sem pasta de configuração".into()))?;
-    save_in(&d, name)
+    let _ = name;
+    Err(crate::Error(
+        "Conecte sua conta pelo launcher. Seu nome vem do cadastro do site.".into(),
+    ))
 }
 
-fn save_in(d: &std::path::Path, name: &str) -> crate::Result<String> {
-    let name = clean(name).ok_or_else(|| crate::Error("nome vazio".into()))?;
-    std::fs::create_dir_all(d).map_err(|e| crate::Error(e.to_string()))?;
-    let body = serde_json::json!({ "name": name }).to_string();
-    std::fs::write(d.join("account.json"), body).map_err(|e| crate::Error(e.to_string()))?;
-    Ok(name)
-}
-
-/// O nome para mostrar aos colegas: a conta Nova Foods, senão o usuário do computador.
+/// O nome da conta autenticada. Nunca usar o usuário do computador como identidade.
 pub fn display_name() -> String {
-    account_name()
-        .or_else(|| {
-            std::env::var("NOVA_FOODS_NAME")
-                .ok()
-                .and_then(|n| clean(&n))
-        })
-        .or_else(|| std::env::var("USER").ok().and_then(|n| clean(&n)))
-        .or_else(|| std::env::var("USERNAME").ok().and_then(|n| clean(&n)))
-        .unwrap_or_else(|| "Nova Foods".into())
+    account_name().unwrap_or_else(|| "Conecte sua conta".into())
 }
 
 /// `<app>://account?name=…` (o site mandando a conta): o nome, se o link for deste app.
@@ -142,11 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn account_name_is_saved_for_all_apps() {
-        let d = std::env::temp_dir().join(format!("nova-account-{}", std::process::id()));
-        assert_eq!(save_in(&d, "  Luca \n").unwrap(), "Luca");
-        assert_eq!(account_name_in(&d).as_deref(), Some("Luca"));
-        assert!(save_in(&d, " ").is_err());
-        let _ = std::fs::remove_dir_all(&d);
+    fn a_name_link_does_not_authenticate_a_person() {
+        assert!(save_account_name("Nome digitado").is_err());
     }
 }

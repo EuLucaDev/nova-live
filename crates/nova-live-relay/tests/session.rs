@@ -102,7 +102,7 @@ fn relay() -> String {
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || rt.block_on(nova_live_relay::run(listener)));
+    std::thread::spawn(move || rt.block_on(nova_live_relay::run_local(listener)));
     format!("ws://{addr}/")
 }
 

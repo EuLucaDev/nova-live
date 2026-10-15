@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
@@ -90,7 +91,7 @@ impl Write for Stream {
     }
 }
 
-fn connect(t: &Target) -> Result<WebSocket<Stream>> {
+fn connect(t: &Target, account_token: Option<&str>) -> Result<WebSocket<Stream>> {
     let addr = (t.host.as_str(), t.port)
         .to_socket_addrs()
         .map_err(|e| err(format!("não encontrei o servidor {}: {e}", t.host)))?
@@ -121,7 +122,23 @@ fn connect(t: &Target) -> Result<WebSocket<Stream>> {
     let mut cfg = WebSocketConfig::default();
     cfg.max_message_size = Some(MAX_MESSAGE);
     cfg.max_frame_size = Some(MAX_MESSAGE);
-    let (ws, _) = tungstenite::client::client_with_config(t.url.as_str(), stream, Some(cfg))
+    let mut request = t
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| err("endereço de colaboração inválido"))?;
+    // Nunca transmitir a conta a um relay arbitrário recebido em um convite.
+    if t.url == crate::DEFAULT_SERVER {
+        let token =
+            account_token.ok_or_else(|| err("Conecte sua conta Nova Foods antes de colaborar."))?;
+        let header = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| err("conexão de conta inválida"))?;
+        request
+            .headers_mut()
+            .insert(tungstenite::http::header::AUTHORIZATION, header);
+    }
+    let (ws, _) = tungstenite::client::client_with_config(request, stream, Some(cfg))
         .map_err(|e| err(format!("o servidor recusou a conexão: {e}")))?;
     let tcp = match ws.get_ref() {
         Stream::Plain(s) => s,
@@ -144,13 +161,27 @@ pub(crate) fn spawn(
     backlog: Arc<AtomicUsize>,
 ) -> Result<(Sender<ClientMsg>, Receiver<ServerMsg>)> {
     let target = parse(server)?;
+    if server == crate::DEFAULT_SERVER {
+        let allowed = match &hello {
+            ClientMsg::Hello { app, .. } => crate::identity::authorized(app),
+            _ => false,
+        };
+        if !allowed {
+            return Err(err(
+                "Conecte sua conta e confira se este aplicativo está liberado para seu setor.",
+            ));
+        }
+    }
     let (out_tx, out_rx) = mpsc::channel::<ClientMsg>();
     let (in_tx, in_rx) = mpsc::channel::<ServerMsg>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+    let account_token = (target.url == crate::DEFAULT_SERVER)
+        .then(crate::identity::token)
+        .flatten();
     std::thread::Builder::new()
         .name("nova-live".into())
         .spawn(move || {
-            let mut ws = match connect(&target) {
+            let mut ws = match connect(&target, account_token.as_deref()) {
                 Ok(ws) => ws,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -165,7 +196,7 @@ pub(crate) fn spawn(
                 return;
             }
             let _ = ready_tx.send(Ok(()));
-            run(ws, out_rx, in_tx, &backlog);
+            run(ws, out_rx, in_tx, &backlog, account_token);
         })
         .map_err(|e| err(e.to_string()))?;
     match ready_rx.recv_timeout(CONNECT_TIMEOUT * 2) {
@@ -180,9 +211,19 @@ fn run(
     out: Receiver<ClientMsg>,
     inbox: Sender<ServerMsg>,
     backlog: &AtomicUsize,
+    account_token: Option<String>,
 ) {
     let mut last_ping = Instant::now();
     loop {
+        if let Some(token) = &account_token
+            && crate::identity::token().as_ref() != Some(token)
+        {
+            let _ = ws.close(None);
+            let _ = inbox.send(ServerMsg::Ended {
+                reason: "Conta alterada. Compartilhe novamente com a conta conectada.".into(),
+            });
+            return;
+        }
         // Escreve tudo o que o app mandou.
         loop {
             match out.try_recv() {

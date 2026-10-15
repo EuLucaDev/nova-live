@@ -27,6 +27,7 @@
 pub mod account;
 mod adapter;
 pub mod cursors;
+pub mod identity;
 pub mod links;
 pub mod media;
 mod net;
