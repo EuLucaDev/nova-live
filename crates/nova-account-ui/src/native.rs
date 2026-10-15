@@ -60,11 +60,30 @@ fn primary(ui: &mut Ui, text: &str, width: f32) -> Response {
     )
 }
 
+/// Os editores instalam famílias próprias em `logic`; egui só as disponibiliza no quadro seguinte.
+/// A tela de conta também respeita essa preparação antes de desenhar títulos/botões.
+fn fonts_ready(ui: &Ui) -> bool {
+    let families = ui.ctx().fonts(|fonts| fonts.families());
+    ui.style()
+        .text_styles
+        .values()
+        .all(|font| families.contains(&font.family))
+        && ui
+            .style()
+            .override_font_id
+            .as_ref()
+            .is_none_or(|font| families.contains(&font.family))
+}
+
 /// Verifica a conta ao abrir o aplicativo. Uma queda de rede não apaga o documento já aberto.
 /// Instalação, abertura pelo launcher e colaboração revalidam permissões separadamente.
 pub fn gate(ui: &mut Ui, app: &str) -> bool {
     soften(ui);
     let ctx = ui.ctx().clone();
+    if !fonts_ready(ui) {
+        ctx.request_repaint();
+        return false;
+    }
     let status = identity::status(app);
     if matches!(
         status,
@@ -417,4 +436,27 @@ pub fn paint_person(
 
 pub fn profile() -> Option<identity::Profile> {
     identity::profile()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn account_screen_waits_for_the_editors_font_registration() {
+        egui::__run_test_ui(|ui| {
+            ui.style_mut().text_styles.insert(
+                egui::TextStyle::Heading,
+                FontId::new(28.0, egui::FontFamily::Name("editor-font-pending".into())),
+            );
+            assert!(!fonts_ready(ui));
+            // Drawing the heading here used to panic before the editor's own first-frame guard.
+            assert!(!gate(ui, "novaphoto"));
+        });
+    }
+    #[test]
+    fn account_screen_accepts_ready_font_families() {
+        egui::__run_test_ui(|ui| {
+            assert!(fonts_ready(ui));
+        });
+    }
 }
