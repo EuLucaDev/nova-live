@@ -217,7 +217,12 @@ fn photo(ctx: &Context, user: &str) -> Option<TextureHandle> {
     let ctx = ctx.clone();
     let user = user.to_string();
     std::thread::spawn(move || {
-        let image = identity::avatar(&user).ok().and_then(|bytes| {
+        let bytes = if let Some(name) = user.strip_prefix("name:") {
+            identity::avatar_by_name(name)
+        } else {
+            identity::avatar(&user)
+        };
+        let image = bytes.ok().and_then(|bytes| {
             let mut reader = image::ImageReader::new(Cursor::new(bytes))
                 .with_guessed_format()
                 .ok()?;
@@ -258,7 +263,10 @@ fn initials(name: &str) -> String {
 }
 
 pub fn avatar(ui: &mut Ui, user_id: Option<&str>, name: &str, size: f32) -> Response {
-    let image = user_id.and_then(|id| photo(ui.ctx(), id));
+    let key = user_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("name:{name}"));
+    let image = photo(ui.ctx(), &key);
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let c = nova_live::cursors::color_for(name);
     let fill = Color32::from_rgb(c[0], c[1], c[2]);
@@ -359,4 +367,54 @@ pub fn account_panel(ui: &mut Ui, app: &str) {
             }
         }
     }
+}
+
+/// Presença do Fig sem alterar seu protocolo binário nem os arquivos compartilhados existentes.
+pub fn paint_person(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    name: &str,
+    fill: Color32,
+) {
+    let key = identity::profile()
+        .filter(|p| p.user.name == name)
+        .map(|p| p.user.id)
+        .unwrap_or_else(|| format!("name:{name}"));
+    painter.circle_filled(center, radius, fill);
+    if let Some(texture) = photo(painter.ctx(), &key) {
+        let rect = egui::Rect::from_center_size(center, Vec2::splat(radius * 2.0));
+        let mut mesh = egui::Mesh::with_texture(texture.id());
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: egui::pos2(0.5, 0.5),
+            color: Color32::WHITE,
+        });
+        for step in 0..=48 {
+            let angle = step as f32 * std::f32::consts::TAU / 48.0;
+            let direction = vec2(angle.cos(), angle.sin());
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: center + direction * radius,
+                uv: egui::pos2(0.5 + direction.x * 0.5, 0.5 + direction.y * 0.5),
+                color: Color32::WHITE,
+            });
+            if step > 0 {
+                mesh.indices.extend_from_slice(&[0, step, step + 1]);
+            }
+        }
+        let _ = rect;
+        painter.add(egui::Shape::mesh(mesh));
+    } else {
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            initials(name),
+            FontId::proportional(radius * 0.8),
+            Color32::WHITE,
+        );
+    }
+}
+
+pub fn profile() -> Option<identity::Profile> {
+    identity::profile()
 }

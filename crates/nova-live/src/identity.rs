@@ -436,12 +436,24 @@ pub fn disconnect() {
 
 /// Foto pequena e autenticada, inclusive de colegas da mesma organização.
 pub fn avatar(user_id: &str) -> Result<Vec<u8>> {
-    if user_id.len() != 36 || !user_id.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-') {
-        return Err(Error("Pessoa inválida.".into()));
+    if user_id.len() != 36 || !user_id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return Err(Error("Foto indisponível.".into()));
     }
+    avatar_url(&format!("{ORIGIN}/api/native/avatar/{user_id}"))
+}
+
+pub fn avatar_by_name(name: &str) -> Result<Vec<u8>> {
+    if name.is_empty() || name.len() > 640 {
+        return Err(Error("Foto indisponível.".into()));
+    }
+    let encoded: String = name.bytes().map(|b| format!("%{b:02X}")).collect();
+    avatar_url(&format!("{ORIGIN}/api/native/avatar?name={encoded}"))
+}
+
+fn avatar_url(url: &str) -> Result<Vec<u8>> {
     let token = token().ok_or_else(|| Error("Conecte sua conta.".into()))?;
     let mut response = agent()
-        .get(format!("{ORIGIN}/api/native/avatar/{user_id}"))
+        .get(url)
         .header("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|_| Error("Foto indisponível.".into()))?;
