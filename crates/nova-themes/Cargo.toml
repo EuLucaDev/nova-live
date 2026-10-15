@@ -8,3 +8,8 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# Saves ThemeKind by variant name ("Studio"), for apps that keep a theme inside a serde enum.
+serde = ["dep:serde"]

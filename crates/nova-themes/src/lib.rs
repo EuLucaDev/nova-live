@@ -15,6 +15,7 @@ mod palettes;
 pub type Rgba = [u8; 4];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ThemeKind {
     Pro,
     ProMedium,
