@@ -139,9 +139,6 @@ pub fn share_button(ui: &mut Ui, people: &[crate::Presence], active: bool) -> Re
                 faces.push((p.user_id.clone(), p.name.clone()));
             }
         }
-        if active || faces.len() > 1 {
-            stack(ui, &faces, 26.0);
-        }
         let label = if active {
             "Compartilhando"
         } else {
@@ -152,15 +149,22 @@ pub fn share_button(ui: &mut Ui, people: &[crate::Presence], active: bool) -> Re
         } else {
             "Convidar pessoas para editar este arquivo"
         };
-        pill(
-            ui,
-            label,
-            vec2(if active { 128.0 } else { 116.0 }, 30.0),
-            BLUE,
-            Color32::WHITE,
-            true,
-        )
-        .on_hover_text(hint)
+        let faces_shown = active || faces.len() > 1;
+        let size = vec2(if active { 128.0 } else { 116.0 }, 30.0);
+        // Na barra montada da direita para a esquerda, o primeiro item fica mais à direita:
+        // o botão vem antes, para as fotos ficarem à esquerda dele, como no Figma.
+        if ui.layout().prefer_right_to_left() {
+            let button = pill(ui, label, size, BLUE, Color32::WHITE, true).on_hover_text(hint);
+            if faces_shown {
+                stack(ui, &faces, 26.0);
+            }
+            button
+        } else {
+            if faces_shown {
+                stack(ui, &faces, 26.0);
+            }
+            pill(ui, label, size, BLUE, Color32::WHITE, true).on_hover_text(hint)
+        }
     })
     .inner
 }
@@ -584,7 +588,13 @@ fn chip(ui: &mut Ui, text: &str) {
 }
 
 fn link(ui: &mut Ui, text: &str) -> Response {
-    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(BLUE)).sense(Sense::click()))
+    // No escuro, o azul da marca some sobre cinza; um azul mais claro mantém o contraste.
+    let color = if ui.visuals().dark_mode {
+        Color32::from_rgb(0x6c, 0xb0, 0xff)
+    } else {
+        BLUE
+    };
+    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).sense(Sense::click()))
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
