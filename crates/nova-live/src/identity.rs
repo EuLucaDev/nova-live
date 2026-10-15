@@ -179,8 +179,10 @@ fn path() -> Option<PathBuf> {
     crate::account::config_dir().map(|d| d.join("session.json"))
 }
 fn load() -> Option<SavedSession> {
-    let p = path()?;
-    let file = fs::File::open(p).ok()?;
+    load_from(&path()?)
+}
+fn load_from(path: &Path) -> Option<SavedSession> {
+    let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_JSON + 1).read_to_end(&mut bytes).ok()?;
     if bytes.len() as u64 > MAX_JSON {
@@ -223,16 +225,34 @@ fn save_to(path: &Path, session: &SavedSession) -> Result<()> {
     }
     Ok(())
 }
-fn finish(generation: u64, result: Result<SavedSession>) {
+fn finish(generation: u64, result: Result<SavedSession>, persist: bool) {
     let mut s = state().lock().unwrap_or_else(PoisonError::into_inner);
     if s.generation != generation {
         return;
     }
+    finish_state(&mut s, result, path().as_deref(), persist);
+}
+fn finish_state(s: &mut State, result: Result<SavedSession>, path: Option<&Path>, persist: bool) {
     match result {
         Ok(session) => {
-            let saved = path()
-                .ok_or_else(|| Error("Pasta da conta indisponível.".into()))
-                .and_then(|p| save_to(&p, &session));
+            // Somente uma confirmação explícita cria/substitui a conexão compartilhada.
+            // Um app validando a conta antiga não pode sobrescrever uma troca feita no launcher.
+            if !persist
+                && !path
+                    .and_then(load_from)
+                    .is_some_and(|latest| latest.token == session.token)
+            {
+                s.status = Status::SignedOut;
+                s.session = None;
+                s.last_refresh = Instant::now();
+                return;
+            }
+            let saved = if persist {
+                path.ok_or_else(|| Error("Pasta da conta indisponível.".into()))
+                    .and_then(|p| save_to(p, &session))
+            } else {
+                Ok(())
+            };
             match saved {
                 Ok(()) => {
                     s.status = Status::Verified(session.profile.clone());
@@ -277,7 +297,7 @@ fn refresh_worker(generation: u64) {
             session.profile = profile;
             Ok(session)
         });
-        finish(generation, result);
+        finish(generation, result, false);
     });
 }
 pub fn refresh() {
@@ -349,7 +369,7 @@ pub fn connect(app: &str) {
     drop(s);
     std::thread::spawn(move || {
         let result = connect_worker(&app, generation);
-        finish(generation, result);
+        finish(generation, result, true);
     });
 }
 fn connect_worker(app: &str, generation: u64) -> Result<SavedSession> {
@@ -421,7 +441,9 @@ pub fn disconnect() {
     s.generation += 1;
     s.status = Status::SignedOut;
     if let Some(path) = path() {
-        let _ = fs::remove_file(path);
+        if load_from(&path).is_some_and(|saved| Some(saved.token.as_str()) == token.as_deref()) {
+            let _ = fs::remove_file(path);
+        }
     }
     drop(s);
     if let Some(token) = token {
@@ -514,6 +536,38 @@ mod tests {
             }
             .allows("novafoods-launcher")
         );
+    }
+    #[test]
+    fn an_old_app_cannot_overwrite_a_new_launcher_connection() {
+        let dir = std::env::temp_dir().join(format!(
+            "nova-account-switch-{}",
+            crate::random_id(8).unwrap()
+        ));
+        let path = dir.join("session.json");
+        let old = SavedSession {
+            token: "old-synthetic-session".into(),
+            expires_at: "2099-01-01".into(),
+            profile: profile(),
+        };
+        let new = SavedSession {
+            token: "new-synthetic-session".into(),
+            ..old.clone()
+        };
+        save_to(&path, &new).unwrap();
+        let mut state = State {
+            app: "novaphoto".into(),
+            generation: 1,
+            status: Status::Loading,
+            session: None,
+            last_refresh: Instant::now(),
+        };
+        finish_state(&mut state, Ok(old), Some(&path), false);
+        assert!(matches!(state.status, Status::SignedOut));
+        assert_eq!(load_from(&path).unwrap().token, new.token);
+        finish_state(&mut state, Ok(new.clone()), Some(&path), false);
+        assert!(matches!(state.status, Status::Verified(_)));
+        assert_eq!(load_from(&path).unwrap().token, new.token);
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn invalid_tokens_are_rejected_without_network_calls() {

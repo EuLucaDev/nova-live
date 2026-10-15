@@ -606,6 +606,35 @@ mod account_tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn strict_relay_refuses_unsigned_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(run(listener));
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let hello = ClientMsg::Hello {
+            protocol: PROTOCOL,
+            app: "novaphoto".into(),
+            room: "room-123456789012".into(),
+            token: "token-123456789012".into(),
+            host_token: Some("host-123456789012".into()),
+            name: "LPC".into(),
+        };
+        client
+            .send(Message::text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let message: ServerMsg = serde_json::from_str(response.to_text().unwrap()).unwrap();
+        assert!(matches!(message, ServerMsg::Refused { .. }));
+        server.abort();
+    }
+    #[tokio::test]
     async fn canonical_identity_and_organization_are_enforced() {
         let state: Shared = Arc::default();
         let (tx, _rx) = mpsc::unbounded_channel();
