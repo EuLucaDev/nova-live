@@ -27,6 +27,15 @@ pub struct Peer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
+    DocumentHello {
+        protocol: u32,
+        payload: String,
+        signature: String,
+    },
+    RenewDocumentTicket {
+        payload: String,
+        signature: String,
+    },
     /// Primeira mensagem. Com `host_token`, cria a sala (anfitrião); sem, entra nela.
     Hello {
         protocol: u32,
@@ -44,11 +53,20 @@ pub enum ClientMsg {
         ctx: Json,
     },
     /// Documento inteiro (desfazer, refazer, mudanças que não são comandos).
-    Replace { local: u64, doc: String },
+    Replace {
+        local: u64,
+        doc: String,
+    },
     /// Anfitrião: documento para quem espera (entrada ou ressincronização).
-    Snapshot { rev: u64, doc: String },
+    Snapshot {
+        rev: u64,
+        doc: String,
+    },
     /// Anfitrião: impressão digital na revisão `rev`.
-    Digest { rev: u64, digest: u64 },
+    Digest {
+        rev: u64,
+        digest: u64,
+    },
     /// Convidado: pede o documento ao anfitrião.
     WantSnapshot,
     /// Saída limpa. Se for o anfitrião, a sessão continua com o próximo participante.
@@ -56,14 +74,27 @@ pub enum ClientMsg {
     /// Anfitrião: encerra a sessão para todos.
     End,
     /// Anfitrião: troca o segredo do convite; o link anterior deixa de valer para quem não entrou.
-    NewToken { token: String },
+    NewToken {
+        token: String,
+    },
     /// Pede a todos a mídia `key` (usada pelo documento e que falta aqui).
-    WantMedia { key: String },
+    WantMedia {
+        key: String,
+    },
     /// Onde está o mouse desta pessoa no documento (`space`: página, aba, sequência… em que ela
     /// está olhando; `x`, `y` nas coordenadas do documento). Não entra na ordem das alterações.
-    Cursor { space: String, x: f64, y: f64 },
+    Cursor {
+        space: String,
+        x: f64,
+        y: f64,
+    },
     /// O mouse saiu do documento.
     CursorGone,
+    View {
+        center: [f32; 2],
+        zoom: f32,
+        rotation: f32,
+    },
     /// Um pedaço da mídia `key` para quem pediu (`to`). `digest` vem no último pedaço.
     MediaChunk {
         to: String,
@@ -131,6 +162,13 @@ pub enum ServerMsg {
         space: String,
         x: f64,
         y: f64,
+    },
+    /// Onde `from` está olhando (centro, zoom, rotação), para quem segue a tela dele.
+    View {
+        from: String,
+        center: [f32; 2],
+        zoom: f32,
+        rotation: f32,
     },
     /// O mouse de `from` saiu do documento.
     CursorGone {

@@ -55,8 +55,13 @@ pub enum Status {
     Loading,
     SignedOut,
     Connecting,
-    Waiting { url: String, code: String },
+    Waiting {
+        url: String,
+        code: String,
+    },
     Verified(Profile),
+    /// Signed grant permits local editing; never authorizes the relay.
+    OfflineVerified(Profile),
     Problem(String),
 }
 
@@ -67,6 +72,8 @@ struct SavedSession {
     token: String,
     expires_at: String,
     profile: Profile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offline_lease: Option<crate::offline::Lease>,
 }
 
 struct State {
@@ -146,31 +153,41 @@ fn post(path: &str, body: &Value) -> Result<Value> {
 
 /// O relay e os apps consultam a mesma fonte de identidade e permissões.
 pub fn validate_token(token: &str) -> Result<Profile> {
+    online_profile(token).map_err(|(_, error)| error)
+}
+
+// Only transport failures, rate limiting and server unavailability permit an offline fallback.
+fn online_profile(token: &str) -> std::result::Result<Profile, (bool, Error)> {
     if token.len() != 43
         || !token
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
     {
-        return Err(Error("Conecte sua conta Nova Foods.".into()));
+        return Err((false, Error("Conecte sua conta Nova Foods.".into())));
     }
     let response = agent()
         .get(format!("{ORIGIN}/api/native/me"))
         .header("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|_| {
-            Error(
-                "Não foi possível validar sua conta. Verifique a internet e tente novamente."
-                    .into(),
+            (
+                true,
+                Error(
+                    "Não foi possível validar sua conta. Verifique a internet e tente novamente."
+                        .into(),
+                ),
             )
         })?;
-    let profile: Profile = serde_json::from_value(decode(response)?)
-        .map_err(|_| Error("Dados de conta inválidos.".into()))?;
+    let code = response.status().as_u16();
+    let transient = matches!(code, 408 | 429 | 500..=599);
+    let profile: Profile = serde_json::from_value(decode(response).map_err(|e| (transient, e))?)
+        .map_err(|_| (false, Error("Dados de conta inválidos.".into())))?;
     if profile.user.name.trim().is_empty()
         || profile.user.name.chars().count() > 160
         || profile.apps.len() > 13
         || profile.departments.len() > 250
     {
-        return Err(Error("Dados de conta inválidos.".into()));
+        return Err((false, Error("Dados de conta inválidos.".into())));
     }
     Ok(profile)
 }
@@ -255,6 +272,9 @@ fn finish_state(s: &mut State, result: Result<SavedSession>, path: Option<&Path>
             };
             match saved {
                 Ok(()) => {
+                    if let Some(lease) = &session.offline_lease {
+                        store_lease(&session.token, lease);
+                    }
                     s.status = Status::Verified(session.profile.clone());
                     s.session = Some(session);
                 }
@@ -293,13 +313,128 @@ fn refresh_worker(generation: u64) {
             }
             return;
         };
-        let result = validate_token(&session.token).and_then(|profile| {
-            session.profile = profile;
-            Ok(session)
-        });
-        finish(generation, result, false);
+        match online_profile(&session.token) {
+            Ok(profile) => {
+                let app = state()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .app
+                    .clone();
+                if !profile.allows(&app) {
+                    remove_lease(&session.token);
+                }
+                session.profile = profile;
+                session.offline_lease = request_offline_lease(&session.token);
+                // A separate token-keyed grant never overwrites a newer launcher connection.
+                if let Some(lease) = &session.offline_lease {
+                    store_lease(&session.token, lease);
+                }
+                finish(generation, Ok(session), false);
+            }
+            Err((transient, error)) => {
+                // Revocation removes the token-keyed cache. A stale copy embedded in an older
+                // launcher session must never restore authority after that removal.
+                let local = crate::offline::configured_key().and_then(|key| {
+                    offline_session(
+                        session.clone(),
+                        load_lease(&session.token),
+                        &key,
+                        unix_now(),
+                    )
+                });
+                if transient && let Some(local) = local {
+                    session = local;
+                    let mut s = state().lock().unwrap_or_else(PoisonError::into_inner);
+                    if s.generation != generation {
+                        return;
+                    }
+                    finish_state(&mut s, Ok(session), path().as_deref(), false);
+                    if let Status::Verified(profile) = &s.status {
+                        s.status = Status::OfflineVerified(profile.clone());
+                    }
+                } else {
+                    if !transient {
+                        remove_lease(&session.token);
+                    }
+                    finish(generation, Err(error), false);
+                }
+            }
+        }
     });
 }
+
+fn offline_session(
+    mut session: SavedSession,
+    cached: Option<crate::offline::Lease>,
+    key: &[u8],
+    now: u64,
+) -> Option<SavedSession> {
+    let lease = cached?;
+    let profile = lease.verify(key, &session.token, ORIGIN, now)?;
+    session.profile = profile;
+    session.offline_lease = Some(lease);
+    Some(session)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+fn request_offline_lease(token: &str) -> Option<crate::offline::Lease> {
+    crate::offline::configured_key()?;
+    let response = agent()
+        .post(format!("{ORIGIN}/api/native/offline-lease"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send_json(json!({}))
+        .ok()?;
+    let lease: crate::offline::Lease = serde_json::from_value(decode(response).ok()?).ok()?;
+    lease.verify(
+        &crate::offline::configured_key()?,
+        token,
+        ORIGIN,
+        unix_now(),
+    )?;
+    Some(lease)
+}
+fn lease_path(token: &str) -> Option<PathBuf> {
+    Some(path()?.with_file_name(format!(
+        "offline-{}.json",
+        crate::offline::token_hash(token)
+    )))
+}
+fn store_lease(token: &str, lease: &crate::offline::Lease) {
+    if let (Some(path), Ok(bytes)) = (lease_path(token), serde_json::to_vec(lease)) {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(path) {
+            let _ = file.write_all(&bytes);
+        }
+    }
+}
+fn load_lease(token: &str) -> Option<crate::offline::Lease> {
+    let mut bytes = Vec::new();
+    fs::File::open(lease_path(token)?)
+        .ok()?
+        .take(MAX_JSON + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_JSON {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+fn remove_lease(token: &str) {
+    if let Some(path) = lease_path(token) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 pub fn refresh() {
     let mut s = state().lock().unwrap_or_else(PoisonError::into_inner);
     s.generation += 1;
@@ -313,6 +448,7 @@ pub fn status(app: &str) -> Status {
     let mut s = state().lock().unwrap_or_else(PoisonError::into_inner);
     let interval = match s.status {
         Status::Verified(_) => 60,
+        Status::OfflineVerified(_) => 30,
         Status::Problem(_) => 30,
         _ => 4,
     };
@@ -344,6 +480,44 @@ pub fn profile() -> Option<Profile> {
         Status::Verified(profile) => Some(profile.clone()),
         _ => None,
     }
+}
+/// Local editing requires a verified online profile or a still-valid signed lease.
+pub fn local_authorized(app: &str) -> bool {
+    let s = state().lock().unwrap_or_else(PoisonError::into_inner);
+    match &s.status {
+        Status::Verified(profile) => profile.allows(app),
+        Status::OfflineVerified(_) => s.session.as_ref().is_some_and(|session| {
+            session
+                .offline_lease
+                .as_ref()
+                .and_then(|lease| {
+                    lease.verify(
+                        &crate::offline::configured_key()?,
+                        &session.token,
+                        ORIGIN,
+                        unix_now(),
+                    )
+                })
+                .is_some_and(|profile| profile.allows(app))
+        }),
+        _ => false,
+    }
+}
+pub(crate) fn credentials(app: &str) -> Option<(Profile, String)> {
+    let s = state().lock().unwrap_or_else(PoisonError::into_inner);
+    let Status::Verified(profile) = &s.status else {
+        return None;
+    };
+    if !profile.allows(app) {
+        return None;
+    }
+    let session = s.session.as_ref()?;
+    if session.profile.user.id != profile.user.id
+        || session.profile.organization.id != profile.organization.id
+    {
+        return None;
+    }
+    Some((profile.clone(), session.token.clone()))
 }
 pub fn authorized(app: &str) -> bool {
     profile().is_some_and(|p| p.allows(app))
@@ -429,7 +603,12 @@ fn connect_worker(app: &str, generation: u64) -> Result<SavedSession> {
             .map_err(|_| Error("Resposta de conexão inválida.".into()))?;
         // Revalida a identidade recebida antes de permitir acesso ou gravar o token.
         let profile = validate_token(&session.token)?;
-        let session = SavedSession { profile, ..session };
+        let offline_lease = request_offline_lease(&session.token);
+        let session = SavedSession {
+            profile,
+            offline_lease,
+            ..session
+        };
         return Ok(session);
     }
     Err(Error("A conexão expirou. Tente novamente.".into()))
@@ -440,10 +619,10 @@ pub fn disconnect() {
     let token = s.session.take().map(|s| s.token);
     s.generation += 1;
     s.status = Status::SignedOut;
-    if let Some(path) = path() {
-        if load_from(&path).is_some_and(|saved| Some(saved.token.as_str()) == token.as_deref()) {
-            let _ = fs::remove_file(path);
-        }
+    if let Some(path) = path()
+        && load_from(&path).is_some_and(|saved| Some(saved.token.as_str()) == token.as_deref())
+    {
+        let _ = fs::remove_file(path);
     }
     drop(s);
     if let Some(token) = token {
@@ -521,6 +700,21 @@ mod tests {
         }
     }
     #[test]
+    fn removal_of_the_grant_cannot_be_undone_by_an_old_launcher_session() {
+        let profile:Profile=serde_json::from_value(serde_json::json!({"user":{"id":"person","name":"Test","avatarUrl":null},"organization":{"id":"org","name":"Test"},"departments":[],"apps":["novaphoto"],"policyEnabled":true,"canManage":false})).unwrap();
+        let session = SavedSession {
+            token: "a".repeat(43),
+            expires_at: String::new(),
+            profile,
+            offline_lease: Some(crate::offline::Lease {
+                payload: "old grant".into(),
+                signature: "old signature".into(),
+            }),
+        };
+        assert!(offline_session(session, None, &[0; 32], 100).is_none());
+    }
+
+    #[test]
     fn identity_uses_the_api_shape_and_respects_app_grants() {
         let profile = profile();
         let value = serde_json::to_value(&profile).unwrap();
@@ -548,6 +742,7 @@ mod tests {
             token: "old-synthetic-session".into(),
             expires_at: "2099-01-01".into(),
             profile: profile(),
+            offline_lease: None,
         };
         let new = SavedSession {
             token: "new-synthetic-session".into(),
@@ -592,6 +787,7 @@ mod tests {
             token: "synthetic-test-token".into(),
             expires_at: "2099-01-01T00:00:00Z".into(),
             profile: profile(),
+            offline_lease: None,
         };
         save_to(&path, &session).unwrap();
         save_to(&path, &session).unwrap();

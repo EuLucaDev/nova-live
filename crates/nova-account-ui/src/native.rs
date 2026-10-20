@@ -102,7 +102,8 @@ pub fn gate(ui: &mut Ui, app: &str) -> bool {
         }
     }
     let unlocked = Id::new(("nova-account-unlocked", app));
-    if matches!(&status, Status::Verified(profile) if profile.allows(app)) {
+    if matches!(&status, Status::Verified(profile) | Status::OfflineVerified(profile) if profile.allows(app))
+    {
         ctx.data_mut(|data| data.insert_temp(unlocked, true));
         return true;
     }
@@ -168,7 +169,7 @@ pub fn gate(ui: &mut Ui, app: &str) -> bool {
                             if ui.link("Cancelar conexão").clicked() { identity::disconnect(); }
                             ctx.request_repaint_after(Duration::from_millis(150));
                         }
-                        Status::Verified(profile) => {
+                        Status::Verified(profile) | Status::OfflineVerified(profile) => {
                             person_row(ui, &profile.user.id, &profile.user.name, &profile.organization.name);
                             ui.add_space(18.0);
                             ui.label(RichText::new("Este aplicativo não está liberado para os seus setores.").size(15.0).strong());
@@ -215,10 +216,10 @@ fn photo(ctx: &Context, user: &str) -> Option<TextureHandle> {
     }
     let key = format!("{}:{user}", profile.organization.id);
     let mut cache = avatars().lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(entry) = cache.get(&key) {
-        if entry.loading || entry.updated.elapsed() < Duration::from_secs(120) {
-            return entry.image.clone();
-        }
+    if let Some(entry) = cache.get(&key)
+        && (entry.loading || entry.updated.elapsed() < Duration::from_secs(120))
+    {
+        return entry.image.clone();
     }
     if cache.len() > 128 {
         cache.clear();
@@ -325,8 +326,11 @@ pub struct Presence {
 }
 
 pub fn account_panel(ui: &mut Ui, app: &str) {
+    if matches!(identity::status(app), Status::OfflineVerified(_)) {
+        ui.label("Sem conexão — edição local autorizada por até sete dias.");
+    }
     match identity::status(app) {
-        Status::Verified(profile) => {
+        Status::Verified(profile) | Status::OfflineVerified(profile) => {
             person_row(
                 ui,
                 &profile.user.id,

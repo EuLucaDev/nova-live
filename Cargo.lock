@@ -860,6 +860,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
  "nova-live-macos",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -881,8 +882,10 @@ dependencies = [
 name = "nova-live-relay"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "nova-live",
+ "ring",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

@@ -33,6 +33,7 @@ struct Member {
     tx: Tx,
     /// Versão do protocolo do app: só quem entende `Promoted` pode virar anfitrião.
     protocol: u32,
+    can_edit: bool,
 }
 
 struct Room {
@@ -70,6 +71,7 @@ impl Room {
 struct State {
     rooms: HashMap<String, Room>,
     next: u64,
+    document_key: Option<Vec<u8>>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -109,7 +111,13 @@ pub async fn run_local(listener: TcpListener) {
 }
 
 async fn run_inner(listener: TcpListener, account_required: bool) {
-    let state: Shared = Arc::default();
+    let state: Shared = Arc::new(Mutex::new(State {
+        document_key: nova_live::document_ticket::key_from_hex(
+            &std::env::var("NOVA_DOCUMENT_PUBLIC_KEY_HEX")
+                .unwrap_or_else(|_| nova_live::offline::NOVA_FOODS_SIGNING_PUBLIC_KEY_HEX.into()),
+        ),
+        ..State::default()
+    }));
     loop {
         let Ok((stream, addr)) = listener.accept().await else {
             continue;
@@ -141,6 +149,8 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
     cfg.max_message_size = Some(MAX_MESSAGE);
     cfg.max_frame_size = Some(MAX_MESSAGE);
     let mut account_token: Option<String> = None;
+    // Tungstenite fixes this callback error type; boxing it changes the required trait.
+    #[allow(clippy::result_large_err)]
     let capture_account =
         |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
          response: tokio_tungstenite::tungstenite::handshake::server::Response| {
@@ -180,7 +190,7 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
     let hello = loop {
         match source.next().await {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(t.as_str()) {
-                Ok(m @ ClientMsg::Hello { .. }) => break m,
+                Ok(m @ (ClientMsg::Hello { .. } | ClientMsg::DocumentHello { .. })) => break m,
                 _ => {
                     let _ = tx.send(ServerMsg::Refused {
                         reason: "mensagem inicial inválida".into(),
@@ -192,16 +202,54 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
             _ => return,
         }
     };
-    let ClientMsg::Hello {
-        protocol,
-        app,
-        room,
-        token,
-        host_token,
-        name,
-    } = hello
-    else {
-        return;
+    let document_key = state.lock().await.document_key.clone();
+    let mut document_claims = None;
+    let (protocol, app, room, token, host_token, name) = match hello {
+        ClientMsg::Hello {
+            protocol,
+            app,
+            room,
+            token,
+            host_token,
+            name,
+        } if !room.starts_with("doc-") => (protocol, app, room, token, host_token, name),
+        ClientMsg::DocumentHello {
+            protocol,
+            payload,
+            signature,
+        } => {
+            let checked = document_key.as_deref().and_then(|key| {
+                nova_live::document_ticket::verify(
+                    &payload,
+                    &signature,
+                    key,
+                    identity::ORIGIN,
+                    nova_live::document_ticket::now(),
+                )
+            });
+            let Some(c) = checked else {
+                let _ = tx.send(ServerMsg::Refused {
+                    reason: "Autorização do documento inválida ou expirada.".into(),
+                });
+                return;
+            };
+            let values = (
+                protocol,
+                c.app_id.clone(),
+                format!("doc-{}", c.document_id),
+                String::new(),
+                None,
+                c.name.clone(),
+            );
+            document_claims = Some(c);
+            values
+        }
+        _ => {
+            let _ = tx.send(ServerMsg::Refused {
+                reason: "Sala reservada para arquivos permanentes.".into(),
+            });
+            return;
+        }
     };
     if !(PROTOCOL_MIN..=PROTOCOL).contains(&protocol) {
         let _ = tx.send(ServerMsg::Refused {
@@ -229,19 +277,34 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
     } else {
         None
     };
-    let me = match join(
-        &state,
-        &app,
-        &room,
-        &token,
-        host_token.as_deref(),
-        &clean_name(&name),
-        account.as_ref(),
-        tx.clone(),
-        protocol,
-    )
-    .await
+    if let Some(c) = &document_claims
+        && account_required
+        && !account
+            .as_ref()
+            .is_some_and(|p| p.user.id == c.user_id && p.organization.id == c.organization_id)
     {
+        let _ = tx.send(ServerMsg::Refused {
+            reason: "A conta não corresponde à autorização do documento.".into(),
+        });
+        return;
+    }
+    let joined = if let Some(c) = &document_claims {
+        join_document(&state, c, tx.clone(), protocol).await
+    } else {
+        join(
+            &state,
+            &app,
+            &room,
+            &token,
+            host_token.as_deref(),
+            &clean_name(&name),
+            account.as_ref(),
+            tx.clone(),
+            protocol,
+        )
+        .await
+    };
+    let me = match joined {
         Ok(id) => id,
         Err(reason) => {
             let _ = tx.send(ServerMsg::Refused { reason });
@@ -254,11 +317,19 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
         tokio::time::Instant::now() + Duration::from_secs(60),
         Duration::from_secs(60),
     );
+    let mut expiry_tick = tokio::time::interval(Duration::from_secs(5));
     loop {
-        let frame = if account_required {
+        let frame = if account_required || document_claims.is_some() {
             tokio::select! {
                 frame = source.next() => frame,
-                _ = lease.tick() => {
+                _ = expiry_tick.tick(), if document_claims.is_some() => {
+                    if document_claims.as_ref().is_some_and(|c| c.expires_at <= nova_live::document_ticket::now()) {
+                        let _ = tx.send(ServerMsg::Refused { reason: "Autorização do documento expirada. Reconecte.".into() });
+                        break;
+                    }
+                    continue;
+                }
+                _ = lease.tick(), if account_required => {
                     let token = account_token.clone().unwrap_or_default();
                     let checked = tokio::task::spawn_blocking(move || identity::validate_token(&token)).await;
                     let valid = match (&account, checked) {
@@ -290,11 +361,61 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
         let Ok(msg) = serde_json::from_str::<ClientMsg>(text.as_str()) else {
             continue;
         };
+        if let ClientMsg::RenewDocumentTicket { payload, signature } = &msg {
+            let renewed = document_key.as_deref().and_then(|key| {
+                nova_live::document_ticket::verify(
+                    payload,
+                    signature,
+                    key,
+                    identity::ORIGIN,
+                    nova_live::document_ticket::now(),
+                )
+            });
+            match (&document_claims, renewed) {
+                (Some(old), Some(new))
+                    if old.document_id == new.document_id
+                        && old.user_id == new.user_id
+                        && old.organization_id == new.organization_id
+                        && old.role == new.role =>
+                {
+                    document_claims = Some(new)
+                }
+                _ => {
+                    let _ = tx.send(ServerMsg::Refused {
+                        reason: "Seu acesso ao documento mudou. Reconecte.".into(),
+                    });
+                    break;
+                }
+            }
+            continue;
+        }
+        if document_claims
+            .as_ref()
+            .is_some_and(|c| c.expires_at <= nova_live::document_ticket::now())
+        {
+            break;
+        }
         let mut st = state.lock().await;
         let Some(r) = st.rooms.get_mut(&room) else {
             break;
         };
         let is_host = r.host.as_deref() == Some(me.as_str());
+        if !r.members.get(&me).is_some_and(|m| m.can_edit)
+            && !matches!(
+                &msg,
+                ClientMsg::View { .. }
+                    | ClientMsg::WantSnapshot
+                    | ClientMsg::WantMedia { .. }
+                    | ClientMsg::Cursor { .. }
+                    | ClientMsg::CursorGone
+                    | ClientMsg::Bye
+            )
+        {
+            let _ = tx.send(ServerMsg::Refused {
+                reason: "Este documento está disponível somente para leitura.".into(),
+            });
+            break;
+        }
         match msg {
             ClientMsg::Op {
                 local,
@@ -364,6 +485,29 @@ async fn serve(stream: TcpStream, _addr: SocketAddr, state: Shared, account_requ
                 if valid_secret(&token) {
                     r.token = token.clone();
                     r.broadcast(&ServerMsg::Token { token });
+                }
+            }
+            ClientMsg::View {
+                center,
+                zoom,
+                rotation,
+            } => {
+                if center.iter().all(|n| n.is_finite() && n.abs() <= 1.0e9)
+                    && zoom.is_finite()
+                    && (0.0001..=10000.0).contains(&zoom)
+                    && rotation.is_finite()
+                    && rotation.abs() <= 360.0
+                {
+                    for (id, m) in &r.members {
+                        if *id != me {
+                            let _ = m.tx.send(ServerMsg::View {
+                                from: me.clone(),
+                                center,
+                                zoom,
+                                rotation,
+                            });
+                        }
+                    }
                 }
             }
             ClientMsg::Cursor { space, x, y } => {
@@ -493,6 +637,7 @@ async fn join(
                     },
                     tx,
                     protocol,
+                    can_edit: true,
                 },
             );
             r.order.push(id.clone());
@@ -526,6 +671,7 @@ async fn join(
                     },
                     tx,
                     protocol,
+                    can_edit: true,
                 },
             );
             r.order.push(id.clone());
@@ -546,6 +692,74 @@ async fn join(
     if let Some(r) = st.rooms.get(room) {
         r.broadcast(&ServerMsg::Peers { peers: r.peers() });
     }
+    Ok(id)
+}
+
+/// Document rooms have no invitation secret. Only a signed, person-bound grant admits a peer.
+async fn join_document(
+    state: &Shared,
+    c: &nova_live::document_ticket::Claims,
+    tx: Tx,
+    protocol: u32,
+) -> Result<String, String> {
+    let mut st = state.lock().await;
+    st.next += 1;
+    let id = format!("p{}", st.next);
+    let room = format!("doc-{}", c.document_id);
+    let r = st.rooms.entry(room).or_insert_with(|| Room {
+        app: c.app_id.clone(),
+        organization_id: Some(c.organization_id.clone()),
+        token: String::new(),
+        host_token: String::new(),
+        host: None,
+        members: HashMap::new(),
+        order: vec![],
+        rev: 0,
+        awaiting: HashSet::new(),
+    });
+    if r.organization_id.as_deref() != Some(&c.organization_id) || r.app != c.app_id {
+        return Err("Documento de outra organização.".into());
+    }
+    let can_edit = c.role != "viewer";
+    let promoted = can_edit && r.host.is_none();
+    if promoted {
+        r.host = Some(id.clone());
+    }
+    r.members.insert(
+        id.clone(),
+        Member {
+            peer: Peer {
+                id: id.clone(),
+                name: clean_name(&c.name),
+                host: promoted,
+                user_id: Some(c.user_id.clone()),
+            },
+            tx,
+            protocol,
+            can_edit,
+        },
+    );
+    r.order.push(id.clone());
+    r.send_to(
+        &id,
+        ServerMsg::Welcome {
+            you: id.clone(),
+            rev: r.rev,
+            peers: r.peers(),
+        },
+    );
+    if promoted {
+        r.send_to(&id, ServerMsg::Promoted);
+        if !r.awaiting.is_empty() {
+            r.send_to(&id, ServerMsg::WantSnapshot);
+        }
+    } else {
+        r.awaiting.insert(id.clone());
+        if let Some(h) = &r.host {
+            r.send_to(h, ServerMsg::WantSnapshot);
+        }
+    }
+    r.broadcast(&ServerMsg::Peers { peers: r.peers() });
     Ok(id)
 }
 
@@ -570,7 +784,11 @@ async fn leave(state: &Shared, room: &str, me: &str) {
     let next = r
         .order
         .iter()
-        .find(|id| r.members.get(*id).is_some_and(|m| m.protocol >= 2))
+        .find(|id| {
+            r.members
+                .get(*id)
+                .is_some_and(|m| m.protocol >= 2 && m.can_edit)
+        })
         .cloned();
     match next {
         Some(id) => {
@@ -583,6 +801,11 @@ async fn leave(state: &Shared, room: &str, me: &str) {
             if !r.awaiting.is_empty() {
                 r.send_to(&id, ServerMsg::WantSnapshot);
             }
+            r.broadcast(&ServerMsg::Peers { peers: r.peers() });
+        }
+        None if room.starts_with("doc-") && !r.members.is_empty() => {
+            r.host = None;
+            r.awaiting.extend(r.order.iter().cloned());
             r.broadcast(&ServerMsg::Peers { peers: r.peers() });
         }
         None => {
@@ -604,6 +827,115 @@ mod account_tests {
             "apps":apps, "policyEnabled":true,"canManage":false
         }))
         .unwrap()
+    }
+    fn claims(role: &str) -> nova_live::document_ticket::Claims {
+        let now = nova_live::document_ticket::now();
+        nova_live::document_ticket::Claims {
+            purpose: "native-document-session".into(),
+            origin: identity::ORIGIN.into(),
+            document_id: "00000000-0000-4000-8000-000000000001".into(),
+            organization_id: "00000000-0000-4000-8000-000000000002".into(),
+            app_id: "novaphoto".into(),
+            user_id: "00000000-0000-4000-8000-000000000003".into(),
+            name: "Test".into(),
+            role: role.into(),
+            issued_at: now,
+            expires_at: now + 300,
+        }
+    }
+    #[tokio::test]
+    async fn persistent_coordinator_is_never_a_reader_and_survives_editor_departure() {
+        let state: Shared = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let viewer = join_document(&state, &claims("viewer"), tx, PROTOCOL)
+            .await
+            .unwrap();
+        let room = format!("doc-{}", claims("viewer").document_id);
+        assert!(state.lock().await.rooms[&room].host.is_none());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let editor = join_document(&state, &claims("editor"), tx, PROTOCOL)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.lock().await.rooms[&room].host.as_deref(),
+            Some(editor.as_str())
+        );
+        leave(&state, &room, &editor).await;
+        let locked = state.lock().await;
+        assert!(locked.rooms[&room].host.is_none());
+        assert!(!locked.rooms[&room].members[&viewer].can_edit);
+        drop(locked);
+        let mut outsider = claims("editor");
+        outsider.organization_id = "00000000-0000-4000-8000-000000000004".into();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(
+            join_document(&state, &outsider, tx, PROTOCOL)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn signed_reader_cannot_mutate_over_the_wire() {
+        use base64::Engine as _;
+        use ring::signature::KeyPair;
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+        let state = Arc::new(Mutex::new(State {
+            document_key: Some(key.public_key().as_ref().to_vec()),
+            ..State::default()
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            serve(stream, addr, state, false).await;
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims("viewer")).unwrap());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(key.sign(payload.as_bytes()).as_ref());
+        client
+            .send(Message::text(
+                serde_json::to_string(&ClientMsg::DocumentHello {
+                    protocol: PROTOCOL,
+                    payload,
+                    signature,
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        client
+            .send(Message::text(
+                serde_json::to_string(&ClientMsg::Replace {
+                    local: 1,
+                    doc: "malicious".into(),
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Ok(frame)) = client.next().await {
+                if let Ok(text) = frame.to_text() {
+                    let msg: ServerMsg = serde_json::from_str(text).unwrap();
+                    assert!(!matches!(
+                        msg,
+                        ServerMsg::Replace { .. } | ServerMsg::Op { .. }
+                    ));
+                    if matches!(msg, ServerMsg::Refused { .. }) {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        assert!(refused);
+        server.abort();
     }
     #[tokio::test]
     async fn strict_relay_refuses_unsigned_connections() {

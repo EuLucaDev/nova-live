@@ -164,6 +164,7 @@ pub(crate) fn spawn(
     if server == crate::DEFAULT_SERVER {
         let allowed = match &hello {
             ClientMsg::Hello { app, .. } => crate::identity::authorized(app),
+            ClientMsg::DocumentHello { .. } => crate::identity::authorized("novaphoto"),
             _ => false,
         };
         if !allowed {

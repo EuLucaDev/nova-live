@@ -27,10 +27,13 @@
 pub mod account;
 mod adapter;
 pub mod cursors;
+pub mod document_ticket;
+pub mod documents;
 pub mod identity;
 pub mod links;
 pub mod media;
 mod net;
+pub mod offline;
 pub mod proto;
 
 pub use adapter::{Adapter, Change, Notice};
@@ -302,6 +305,8 @@ pub struct Live {
     pub(crate) backlog: Arc<AtomicUsize>,
     /// Mouses (o meu e os dos colegas).
     pub(crate) cursors: cursors::CursorState,
+    views: std::collections::HashMap<String, ([f32; 2], f32, f32)>,
+    view_sent: Option<Instant>,
 }
 
 impl Live {
@@ -344,6 +349,34 @@ impl Live {
         Self::start(Role::Guest, invite.clone(), hello)
     }
 
+    /// Opens the live room after the caller has downloaded the persisted revision.
+    pub fn document(server: &str, payload: &str, signature: &str) -> Result<Live> {
+        let claims =
+            document_ticket::decode(payload).ok_or_else(|| err("Autorização inválida."))?;
+        let invite = Invite {
+            app: claims.app_id,
+            server: server.into(),
+            room: format!("doc-{}", claims.document_id),
+            token: String::new(),
+        };
+        let mut live = Self::start(
+            Role::Guest,
+            invite,
+            ClientMsg::DocumentHello {
+                protocol: proto::PROTOCOL,
+                payload: payload.into(),
+                signature: signature.into(),
+            },
+        )?;
+        live.loaded = true;
+        Ok(live)
+    }
+    pub fn renew_document_ticket(&mut self, payload: &str, signature: &str) {
+        self.send(ClientMsg::RenewDocumentTicket {
+            payload: payload.into(),
+            signature: signature.into(),
+        });
+    }
     fn start(role: Role, invite: Invite, hello: ClientMsg) -> Result<Live> {
         let backlog = Arc::new(AtomicUsize::new(0));
         let (out, inbox) = net::spawn(&invite.server, hello, backlog.clone())?;
@@ -370,14 +403,36 @@ impl Live {
             media: media::MediaState::default(),
             backlog,
             cursors: cursors::CursorState::default(),
+            views: Default::default(),
+            view_sent: None,
         })
     }
 
+    pub fn view(&self, peer: &str) -> Option<([f32; 2], f32, f32)> {
+        self.views.get(peer).copied()
+    }
+    pub fn send_view(&mut self, center: [f32; 2], zoom: f32, rotation: f32) {
+        if self
+            .view_sent
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(100))
+        {
+            return;
+        }
+        self.view_sent = Some(Instant::now());
+        self.send(ClientMsg::View {
+            center,
+            zoom,
+            rotation,
+        });
+    }
     pub fn role(&self) -> Role {
         self.role
     }
     pub fn invite(&self) -> &Invite {
         &self.invite
+    }
+    pub fn local_peer_id(&self) -> &str {
+        &self.me
     }
     pub fn peers(&self) -> &[Peer] {
         &self.peers
@@ -511,6 +566,8 @@ impl Live {
                 events.push(Event::Peers(peers));
             }
             ServerMsg::Peers { peers } => {
+                self.views
+                    .retain(|id, _| peers.iter().any(|peer| peer.id == *id));
                 self.peers = peers.clone();
                 events.push(Event::Peers(peers));
             }
@@ -591,6 +648,22 @@ impl Live {
                     self.check = None;
                     self.digest_sent_for = 0;
                     events.push(Event::Promoted);
+                }
+            }
+            ServerMsg::View {
+                from,
+                center,
+                zoom,
+                rotation,
+            } => {
+                if self.peers.iter().any(|p| p.id == from)
+                    && center.iter().all(|n| n.is_finite() && n.abs() <= 1.0e9)
+                    && zoom.is_finite()
+                    && (0.0001..=10000.0).contains(&zoom)
+                    && rotation.is_finite()
+                    && rotation.abs() <= 360.0
+                {
+                    self.views.insert(from, (center, zoom, rotation));
                 }
             }
             ServerMsg::Cursor { from, space, x, y } => self.cursor_seen(from, Some((space, x, y))),

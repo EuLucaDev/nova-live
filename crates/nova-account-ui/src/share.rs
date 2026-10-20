@@ -18,6 +18,7 @@ const ROW: f32 = 46.0;
 /// O que a pessoa pediu na janela; o app executa como já fazia.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareAction {
+    Permanent,
     /// Começar a compartilhar este arquivo.
     Host,
     /// Entrar com o convite colado.
@@ -79,6 +80,11 @@ pub fn share_window(ctx: &Context, open: &mut bool, view: ShareView<'_>) -> Opti
             ui.add_space(10.0);
             account_row(ui, view.app);
             divider(ui);
+            if view.app == "novaphoto"
+                && ui.button("Arquivos compartilhados permanentes…").clicked()
+            {
+                action = Some(ShareAction::Permanent);
+            }
             match view.live {
                 None => action = invite_or_join(ui, view.this_doc, view.invite_text),
                 Some(live) => {
